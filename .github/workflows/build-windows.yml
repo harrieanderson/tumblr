@@ -1,0 +1,22 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build -o tumblr.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tumblr-windows
+          path: tumblr.exe

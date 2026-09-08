@@ -20,20 +20,31 @@ const (
 )
 
 func chromePath() (string, error) {
-	candidates := []string{
-		os.Getenv("PROGRAMFILES") + `\Google\Chrome\Application\chrome.exe`,
-		os.Getenv("PROGRAMFILES(X86)") + `\Google\Chrome\Application\chrome.exe`,
-		os.Getenv("LOCALAPPDATA") + `\Google\Chrome\Application\chrome.exe`,
+	var candidates []string
+	if p, err := exec.LookPath("chrome.exe"); err == nil {
+		candidates = append(candidates, p)
 	}
+	if p, err := exec.LookPath("chrome"); err == nil {
+		candidates = append(candidates, p)
+	}
+	candidates = append(candidates,
+		os.Getenv("PROGRAMFILES")+`\Google\Chrome\Application\chrome.exe`,
+		os.Getenv("ProgramFiles(x86)")+`\Google\Chrome\Application\chrome.exe`,
+		os.Getenv("LOCALAPPDATA")+`\Google\Chrome\Application\chrome.exe`,
+		os.Getenv("PROGRAMFILES")+`\Google\Chrome Beta\Application\chrome.exe`,
+		os.Getenv("LOCALAPPDATA")+`\Google\Chrome Beta\Application\chrome.exe`,
+	)
+	seen := map[string]bool{}
 	for _, p := range candidates {
-		if p == "" {
+		if p == "" || strings.HasPrefix(p, `\`) || seen[p] {
 			continue
 		}
+		seen[p] = true
 		if _, err := os.Stat(p); err == nil {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("chrome.exe not found")
+	return "", fmt.Errorf("chrome.exe not found — install Google Chrome from https://www.google.com/chrome/")
 }
 
 func profileDir() (string, error) {
@@ -106,6 +117,11 @@ func loginWithRealChrome(auth *Auth) error {
 		return err
 	}
 	fmt.Println("Synced cookies. You can close the bot Chrome window.")
+	client := &http.Client{}
+	if err := refreshCSRF(client, auth); err != nil {
+		fmt.Println("Could not refresh CSRF yet:", err)
+	}
+	maybeFillBlog(client, auth)
 	return nil
 }
 

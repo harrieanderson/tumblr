@@ -1,0 +1,40 @@
+{
+  "blogSearchQueries": [
+    "brat",
+    "daddy's angel",
+    "onlyfans",
+    "fansly",
+    "thirst trap",
+    "gay nsfw"
+  ],
+  "blogsPerSearch": 15,
+  "seedBlogs": [],
+  "seedOnly": true,
+  "seedPostsPerBlog": 5,
+  "queries": [
+    "nsfw",
+    "smut",
+    "lewd",
+    "thirst",
+    "gay nsfw",
+    "mlm",
+    "onlyfans"
+  ],
+  "maxPosts": 5,
+  "maxFollows": 8,
+  "delaySeconds": 55,
+  "delayJitterSeconds": 40,
+  "requireActiveDays": 21,
+  "preferMale": true,
+  "skipIfFemaleSignals": true,
+  "includeRebloggers": true,
+  "preferRebloggers": true,
+  "engageBeforeFollow": true,
+  "reblogTheirPosts": 1,
+  "likePinned": true,
+  "likeExtraPosts": 2,
+  "likeDelaySeconds": 10,
+  "minNotes": 5,
+  "maxNotes": 2000,
+  "dryRun": false
+}

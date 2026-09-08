@@ -1,0 +1,38 @@
+{
+  "durationMinutes": 90,
+  "scrollMinSeconds": 25,
+  "scrollMaxSeconds": 110,
+  "idleChance": 0.28,
+  "idleMinSeconds": 50,
+  "idleMaxSeconds": 220,
+  "likeChance": 0.22,
+  "reblogChance": 0.32,
+  "followChance": 0.26,
+  "followBurstMin": 1,
+  "followBurstMax": 2,
+  "maxLikes": 18,
+  "maxReblogs": 14,
+  "maxFollows": 8,
+  "categories": [
+    {
+      "name": "horny",
+      "weight": 48,
+      "queries": ["nsfw", "thirst", "lewd", "gay nsfw", "smut", "mlm"]
+    },
+    {
+      "name": "cats",
+      "weight": 18,
+      "queries": ["cats", "cute cats", "kitten", "catblr"]
+    },
+    {
+      "name": "cute",
+      "weight": 18,
+      "queries": ["cute", "wholesome", "aww", "soft"]
+    },
+    {
+      "name": "nature",
+      "weight": 16,
+      "queries": ["nature", "landscape", "flowers", "forest"]
+    }
+  ]
+}

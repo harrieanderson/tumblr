@@ -1,0 +1,8 @@
+pics/
+pics/posted/
+config/auth.json
+chrome-data/
+data/
+scraped/
+*.exe
+tumblr.exe

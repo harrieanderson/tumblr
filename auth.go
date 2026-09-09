@@ -68,3 +68,69 @@ func refreshCSRF(client *http.Client, auth *Auth) error {
 	auth.CSRF = csrf
 	return saveAuth(*auth)
 }
+
+// syncAuthIdentity pulls /api/v2/user/info and sets auth.Blog to the primary blog UUID.
+func syncAuthIdentity(client *http.Client, auth *Auth) (blogName string, err error) {
+	req, err := http.NewRequest("GET", "https://www.tumblr.com/api/v2/user/info", nil)
+	if err != nil {
+		return "", err
+	}
+	setCommonHeaders(req, *auth)
+	req.Header.Set("X-CSRF", auth.CSRF)
+	req.Header.Set("Referer", "https://www.tumblr.com/dashboard")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s: %s", resp.Status, truncate(string(body), 120))
+	}
+	if csrf := resp.Header.Get("X-CSRF"); csrf != "" {
+		auth.CSRF = csrf
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "", err
+	}
+	response, _ := raw["response"].(map[string]any)
+	user, _ := response["user"].(map[string]any)
+	if user == nil {
+		return "", fmt.Errorf("missing user in info response")
+	}
+
+	blogs, _ := user["blogs"].([]any)
+	var uuid, name string
+	for _, b := range blogs {
+		bm, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		n := anyToString(bm["name"])
+		u := firstNonEmpty(anyToString(bm["uuid"]), anyToString(bm["blog_uuid"]))
+		primary := bm["primary"] == true
+		if u == "" {
+			continue
+		}
+		if primary || uuid == "" {
+			uuid, name = u, n
+		}
+		if primary {
+			break
+		}
+	}
+	if uuid == "" {
+		return "", fmt.Errorf("no blog uuid in user/info")
+	}
+	auth.Blog = uuid
+	if err := saveAuth(*auth); err != nil {
+		return name, err
+	}
+	return name, nil
+}

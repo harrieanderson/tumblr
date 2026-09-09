@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,7 +37,11 @@ func likePinnedAndRecent(client *http.Client, auth *Auth, blog string, cfg Follo
 
 	delay := cfg.LikeDelaySeconds
 	if delay <= 0 {
-		delay = 8
+		delay = 14
+	}
+	jitter := cfg.LikeDelayJitterSeconds
+	if jitter < 0 {
+		jitter = 0
 	}
 
 	for i, t := range targets {
@@ -58,7 +63,11 @@ func likePinnedAndRecent(client *http.Client, auth *Auth, blog string, cfg Follo
 			continue
 		}
 		if i < len(targets)-1 {
-			time.Sleep(time.Duration(delay) * time.Second)
+			wait := delay
+			if jitter > 0 {
+				wait += rand.Intn(jitter + 1)
+			}
+			time.Sleep(time.Duration(wait) * time.Second)
 		}
 	}
 }

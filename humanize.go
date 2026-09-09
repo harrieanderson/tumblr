@@ -27,6 +27,7 @@ type HumanizeConfig struct {
 	LikeChance       float64            `json:"likeChance"`
 	ReblogChance     float64            `json:"reblogChance"`
 	FollowChance     float64            `json:"followChance"`
+	MessageChance    float64            `json:"messageChance"`
 	FollowBurstMin   int                `json:"followBurstMin"`
 	FollowBurstMax   int                `json:"followBurstMax"`
 	MaxLikes         int                `json:"maxLikes"`
@@ -51,20 +52,35 @@ func runHumanize() {
 	}
 	if err := syncCookiesFromChrome(&auth); err != nil {
 		if !authHasSID(auth) {
-			fmt.Println("Cookie sync failed:", err)
-			fmt.Println("Try: go run . -login")
+			fmt.Println("Cookie sync failed — trying auto-login…")
+			if err := loginWithRealChrome(&auth); err != nil {
+				fmt.Println("Login failed:", err)
+				return
+			}
+		} else {
+			fmt.Println("Using saved cookies")
+		}
+	}
+
+	client := newHumanClient()
+	if err := ensureSession(client, &auth); err != nil {
+		fmt.Println("Session dead — trying auto-login…")
+		if err := loginWithRealChrome(&auth); err != nil {
+			fmt.Println("Login failed:", err)
 			return
 		}
-		fmt.Println("Using saved cookies")
+		if err := ensureSession(client, &auth); err != nil {
+			fmt.Println("Session still dead:", err)
+			return
+		}
 	}
-
-	client := &http.Client{Timeout: 45 * time.Second}
-	if err := ensureSession(client, &auth); err != nil {
-		fmt.Println("Session dead:", err)
-		return
-	}
+	warmSession(client, &auth)
 
 	followCfg := loadFollowConfig()
+	// Cap session follows even lower than follow.json for brand-new human pacing.
+	if followCfg.MaxFollows > cfg.MaxFollows {
+		followCfg.MaxFollows = cfg.MaxFollows
+	}
 	already, err := loadFollowed()
 	if err != nil {
 		fmt.Println("Error loading followed list:", err)
@@ -74,12 +90,13 @@ func runHumanize() {
 	duration := time.Duration(cfg.DurationMinutes) * time.Minute
 	deadline := time.Now().Add(duration)
 
-	fmt.Printf("Reach session for ~%s\n", duration)
-	fmt.Println("Best-practice mix: idle, niche reblogs, like→reblog→soft-follow (rebloggers first)")
+	fmt.Printf("Human session for ~%s (slow NSFW scour + cover browsing)\n", duration)
+	fmt.Println("Pace: lots of idle, few follows, peek blogs before engage, DMs off")
 
 	likes, reblogs, follows := 0, 0, 0
 	seen := map[string]bool{}
 	rebloggedFile := loadStringSet("data/reblogged.json")
+	noFollowUntil := time.Now().Add(8 * time.Minute) // warm browsing only
 
 	for time.Now().Before(deadline) {
 		if err := ensureSession(client, &auth); err != nil {
@@ -92,19 +109,39 @@ func runHumanize() {
 		case roll < cfg.IdleChance:
 			doIdle(client, auth, cfg)
 
-		case follows < cfg.MaxFollows && roll < cfg.IdleChance+cfg.FollowChance:
+		case follows < cfg.MaxFollows && time.Now().After(noFollowUntil) &&
+			roll < cfg.IdleChance+cfg.FollowChance:
 			burst := randRange(cfg.FollowBurstMin, cfg.FollowBurstMax)
 			left := cfg.MaxFollows - follows
 			if burst > left {
 				burst = left
 			}
-			fmt.Printf("\n--- Reach engage burst (up to %d) ---\n", burst)
+			fmt.Printf("\n--- Soft reach (up to %d follow) ---\n", burst)
 			n, skipped := followEngagersBurst(client, &auth, followCfg, already, burst)
 			follows += n
 			_ = saveFollowed(already)
-			fmt.Printf("--- Reach burst done (+%d, skipped %d)  [follows=%d likes=%d reblogs=%d] ---\n",
+			fmt.Printf("--- Reach done (+%d, skipped %d)  [follows=%d likes=%d reblogs=%d] ---\n",
 				n, skipped, follows, likes, reblogs)
-			time.Sleep(time.Duration(randRange(35, 90)) * time.Second)
+			humanPause(90, 210)
+
+		case roll < cfg.IdleChance+cfg.FollowChance+cfg.MessageChance:
+			if cfg.MessageChance <= 0 {
+				continue
+			}
+			fmt.Println("\n--- Checking Messages inbox ---")
+			msgCfg := loadMessageConfig()
+			n, err := messageInboxBurst(client, &auth, msgCfg)
+			if err != nil {
+				fmt.Println("  messages fail:", err)
+				if isForbidden(err) || isUnauthorized(err) {
+					fmt.Println("  Tumblr is blocking the DM API right now (soft 403).")
+					fmt.Println("  Skipping further inbox checks this session.")
+					cfg.MessageChance = 0
+				}
+			} else {
+				fmt.Printf("--- Messages done (+%d replies) ---\n", n)
+			}
+			humanPause(40, 100)
 
 		default:
 			l, r := browseAndEngage(client, auth, cfg, deadline, seen, rebloggedFile, likes, reblogs)
@@ -112,6 +149,10 @@ func runHumanize() {
 			wait := randRange(cfg.ScrollMinSeconds, cfg.ScrollMaxSeconds)
 			fmt.Printf("Scrolling on… (%ds)  [follows=%d likes=%d reblogs=%d]\n", wait, follows, likes, reblogs)
 			_ = browseDashboard(client, auth)
+			if rand.Float64() < 0.35 {
+				humanPause(3, 10)
+				_ = browseDashboard(client, auth)
+			}
 			time.Sleep(time.Duration(wait) * time.Second)
 		}
 	}
@@ -181,7 +222,7 @@ func browseAndEngage(
 		seen[p.ID] = true
 
 		fmt.Printf("  looking at %s/%s — %s\n", p.Blog, p.ID, truncate(p.Summary, 50))
-		time.Sleep(time.Duration(randRange(4, 18)) * time.Second)
+		humanPause(6, 28)
 
 		wantLike := likes < cfg.MaxLikes && rand.Float64() < likeChance
 		wantReblog := reblogs < cfg.MaxReblogs && !rebloggedFile[p.ID] && rand.Float64() < reblogChance
@@ -198,7 +239,7 @@ func browseAndEngage(
 			} else {
 				likes++
 			}
-			time.Sleep(time.Duration(randRange(3, 12)) * time.Second)
+			humanPause(5, 18)
 		}
 
 		if wantReblog && p.ReblogKey != "" {
@@ -210,7 +251,7 @@ func browseAndEngage(
 				rebloggedFile[p.ID] = true
 				_ = saveStringSet("data/reblogged.json", rebloggedFile)
 			}
-			time.Sleep(time.Duration(randRange(8, 25)) * time.Second)
+			humanPause(12, 40)
 		}
 	}
 	return likes, reblogs
@@ -218,25 +259,26 @@ func browseAndEngage(
 
 func defaultHumanizeConfig() HumanizeConfig {
 	return HumanizeConfig{
-		DurationMinutes:  90,
-		ScrollMinSeconds: 25,
-		ScrollMaxSeconds: 110,
-		IdleChance:       0.28,
-		IdleMinSeconds:   50,
-		IdleMaxSeconds:   220,
-		LikeChance:       0.22,
-		ReblogChance:     0.32,
-		FollowChance:     0.26,
+		DurationMinutes:  55,
+		ScrollMinSeconds: 45,
+		ScrollMaxSeconds: 140,
+		IdleChance:       0.40,
+		IdleMinSeconds:   70,
+		IdleMaxSeconds:   280,
+		LikeChance:       0.18,
+		ReblogChance:     0.22,
+		FollowChance:     0.14,
+		MessageChance:    0,
 		FollowBurstMin:   1,
-		FollowBurstMax:   2,
-		MaxLikes:         18,
-		MaxReblogs:       14,
-		MaxFollows:       8,
+		FollowBurstMax:   1,
+		MaxLikes:         8,
+		MaxReblogs:       5,
+		MaxFollows:       3,
 		Categories: []HumanizeCategory{
-			{Name: "horny", Weight: 48, Queries: []string{"nsfw", "thirst", "lewd", "gay nsfw", "smut"}},
-			{Name: "cats", Weight: 18, Queries: []string{"cats", "cute cats", "kitten"}},
-			{Name: "cute", Weight: 18, Queries: []string{"cute", "wholesome", "aww"}},
-			{Name: "nature", Weight: 16, Queries: []string{"nature", "landscape", "flowers"}},
+			{Name: "horny", Weight: 75, Queries: []string{
+				"nsfw", "thirst", "thirst trap", "lewd", "smut", "onlyfans", "brat", "horny",
+			}},
+			{Name: "cover", Weight: 25, Queries: []string{"cute", "wholesome", "aesthetic", "fashion"}},
 		},
 	}
 }
@@ -249,7 +291,10 @@ func normalizeHumanizeConfig(cfg *HumanizeConfig) {
 		cfg.IdleChance = 0.28
 	}
 	if cfg.FollowChance <= 0 {
-		cfg.FollowChance = 0.26
+		cfg.FollowChance = 0.24
+	}
+	if cfg.MessageChance <= 0 {
+		cfg.MessageChance = 0.12
 	}
 	if cfg.FollowBurstMin <= 0 {
 		cfg.FollowBurstMin = 1

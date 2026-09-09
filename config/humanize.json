@@ -1,38 +1,38 @@
 {
-  "durationMinutes": 90,
-  "scrollMinSeconds": 25,
-  "scrollMaxSeconds": 110,
-  "idleChance": 0.28,
-  "idleMinSeconds": 50,
-  "idleMaxSeconds": 220,
-  "likeChance": 0.22,
-  "reblogChance": 0.32,
-  "followChance": 0.26,
+  "durationMinutes": 55,
+  "scrollMinSeconds": 45,
+  "scrollMaxSeconds": 140,
+  "idleChance": 0.40,
+  "idleMinSeconds": 70,
+  "idleMaxSeconds": 280,
+  "likeChance": 0.18,
+  "reblogChance": 0.22,
+  "followChance": 0.14,
+  "messageChance": 0,
   "followBurstMin": 1,
-  "followBurstMax": 2,
-  "maxLikes": 18,
-  "maxReblogs": 14,
-  "maxFollows": 8,
+  "followBurstMax": 1,
+  "maxLikes": 8,
+  "maxReblogs": 5,
+  "maxFollows": 3,
   "categories": [
     {
       "name": "horny",
-      "weight": 48,
-      "queries": ["nsfw", "thirst", "lewd", "gay nsfw", "smut", "mlm"]
+      "weight": 75,
+      "queries": [
+        "nsfw",
+        "thirst",
+        "thirst trap",
+        "lewd",
+        "smut",
+        "onlyfans",
+        "brat",
+        "horny"
+      ]
     },
     {
-      "name": "cats",
-      "weight": 18,
-      "queries": ["cats", "cute cats", "kitten", "catblr"]
-    },
-    {
-      "name": "cute",
-      "weight": 18,
-      "queries": ["cute", "wholesome", "aww", "soft"]
-    },
-    {
-      "name": "nature",
-      "weight": 16,
-      "queries": ["nature", "landscape", "flowers", "forest"]
+      "name": "cover",
+      "weight": 25,
+      "queries": ["cute", "wholesome", "aesthetic", "fashion"]
     }
   ]
 }

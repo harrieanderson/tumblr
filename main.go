@@ -21,10 +21,14 @@ func main() {
 	followOnly := false
 	photoOnly := false
 	humanizeOnly := false
+	messagesOnly := false
+	messagesReply := false
 	postsOnly := false
 	photoFile := ""
 	photoCaption := ""
 	debugSearch := ""
+	seedScan := false
+	probeMsg := false
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -38,12 +42,20 @@ func main() {
 			scrapeOnly = true
 		case "-follow":
 			followOnly = true
+		case "-messages":
+			messagesOnly = true
+		case "-messages-reply":
+			messagesReply = true
 		case "-photo":
 			photoOnly = true
 		case "-humanize":
 			humanizeOnly = true
 		case "-posts":
 			postsOnly = true
+		case "-seed-scan":
+			seedScan = true
+		case "-probe-msg":
+			probeMsg = true
 		case "-photo-file":
 			if i+1 < len(args) {
 				photoFile = args[i+1]
@@ -73,7 +85,9 @@ func main() {
 	if loginOnly {
 		if err := loginWithRealChrome(&auth); err != nil {
 			fmt.Println("Login/sync failed:", err)
+			return
 		}
+		fmt.Println("Login OK — ready. Run go run . for a session, or go run . -messages to check inbox.")
 		return
 	}
 
@@ -88,6 +102,28 @@ func main() {
 		return
 	}
 
+	if seedScan {
+		seeds := []string{"lujuria-zen", "toetobrate", "arhaicna"}
+		// Optional: go run . -seed-scan blog1 blog2 ...
+		rest := []string{}
+		for _, a := range args {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			rest = append(rest, a)
+		}
+		if len(rest) > 0 {
+			seeds = rest
+		}
+		runSeedScan(seeds)
+		return
+	}
+
+	if probeMsg {
+		runProbeMsg()
+		return
+	}
+
 	if scrapeOnly {
 		runScrape()
 		return
@@ -95,6 +131,16 @@ func main() {
 
 	if followOnly {
 		runFollowLikers()
+		return
+	}
+
+	if messagesOnly {
+		runMessages()
+		return
+	}
+
+	if messagesReply {
+		runMessagesReply()
 		return
 	}
 
@@ -125,11 +171,13 @@ func main() {
 
 	fmt.Println("Unknown flags. Try: go run .")
 	fmt.Println("  (no flags)  reach session (seed blogs → engagers)")
-	fmt.Println("  -follow     reach engage only")
+	fmt.Println("  -messages        print Messages inbox (names + contents)")
+	fmt.Println("  -messages-reply  auto-reply unread DMs (AI if configured)")
+	fmt.Println("  -follow          reach engage only")
 	fmt.Println("  -gui        open GUI")
 	fmt.Println("  -posts      text queue")
 	fmt.Println("  -photo      photo queue")
-	fmt.Println("  -login      Chrome login sync")
+	fmt.Println("  -login      auto-login then start reach session")
 }
 
 func runTextQueue() {

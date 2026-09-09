@@ -1,6 +1,7 @@
 pics/
 pics/posted/
 config/auth.json
+config/credentials.json
 chrome-data/
 data/
 scraped/

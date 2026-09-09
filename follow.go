@@ -14,29 +14,33 @@ import (
 )
 
 type FollowConfig struct {
-	Queries             []string `json:"queries"`
-	BlogSearchQueries   []string `json:"blogSearchQueries"`
-	SeedBlogs           []string `json:"seedBlogs"`
-	MaxPosts            int      `json:"maxPosts"`
-	MaxFollows          int      `json:"maxFollows"`
-	DelaySeconds        int      `json:"delaySeconds"`
-	DelayJitterSeconds  int      `json:"delayJitterSeconds"`
-	RequireActiveDays   int      `json:"requireActiveDays"`
-	PreferMale          bool     `json:"preferMale"`
-	SkipIfFemaleSignals bool     `json:"skipIfFemaleSignals"`
-	IncludeRebloggers   bool     `json:"includeRebloggers"`
-	PreferRebloggers    bool     `json:"preferRebloggers"`
-	EngageBeforeFollow  bool     `json:"engageBeforeFollow"`
-	ReblogTheirPosts    int      `json:"reblogTheirPosts"`
-	LikePinned          bool     `json:"likePinned"`
-	LikeExtraPosts      int      `json:"likeExtraPosts"`
-	LikeDelaySeconds    int      `json:"likeDelaySeconds"`
-	SeedPostsPerBlog    int      `json:"seedPostsPerBlog"`
-	BlogsPerSearch      int      `json:"blogsPerSearch"`
-	SeedOnly            bool     `json:"seedOnly"`
-	MinNotes            int      `json:"minNotes"`
-	MaxNotes            int      `json:"maxNotes"`
-	DryRun              bool     `json:"dryRun"`
+	Queries                 []string `json:"queries"`
+	BlogSearchQueries       []string `json:"blogSearchQueries"`
+	SeedBlogs               []string `json:"seedBlogs"`
+	MaxPosts                int      `json:"maxPosts"`
+	MaxFollows              int      `json:"maxFollows"`
+	DelaySeconds            int      `json:"delaySeconds"`
+	DelayJitterSeconds      int      `json:"delayJitterSeconds"`
+	RequireActiveDays       int      `json:"requireActiveDays"`
+	PreferMale              bool     `json:"preferMale"`
+	SkipIfFemaleSignals     bool     `json:"skipIfFemaleSignals"`
+	IncludeRebloggers       bool     `json:"includeRebloggers"`
+	PreferRebloggers        bool     `json:"preferRebloggers"`
+	EngageBeforeFollow      bool     `json:"engageBeforeFollow"`
+	ReblogTheirPosts        int      `json:"reblogTheirPosts"`
+	LikePinned              bool     `json:"likePinned"`
+	LikeExtraPosts          int      `json:"likeExtraPosts"`
+	LikeDelaySeconds        int      `json:"likeDelaySeconds"`
+	LikeDelayJitterSeconds  int      `json:"likeDelayJitterSeconds"`
+	SeedPostsPerBlog        int      `json:"seedPostsPerBlog"`
+	BlogsPerSearch          int      `json:"blogsPerSearch"`
+	SeedOnly                bool     `json:"seedOnly"`
+	MinNotes                int      `json:"minNotes"`
+	MaxNotes                int      `json:"maxNotes"`
+	DryRun                  bool     `json:"dryRun"`
+	// Human-mode: sometimes browse/like without following; sometimes skip engagers.
+	FollowAfterEngageChance float64 `json:"followAfterEngageChance"`
+	SkipEngagerChance       float64 `json:"skipEngagerChance"`
 }
 
 type Engager struct {
@@ -57,12 +61,13 @@ func runFollowLikers() {
 	}
 
 	cfg := loadFollowConfig()
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newHumanClient()
 	if err := ensureSession(client, &auth); err != nil {
 		fmt.Println("Session error:", err)
 		fmt.Println("Try: go run . -login")
 		return
 	}
+	warmSession(client, &auth)
 
 	already, err := loadFollowed()
 	if err != nil {
@@ -70,7 +75,7 @@ func runFollowLikers() {
 		return
 	}
 
-	fmt.Println("Reach engage: like → reblog their post → soft-follow (rebloggers first)...")
+	fmt.Println("Human reach: peek → like → maybe reblog → sometimes soft-follow…")
 	n, skipped := followEngagersBurst(client, &auth, cfg, already, cfg.MaxFollows)
 	_ = saveFollowed(already)
 	fmt.Printf("\nDone. Engaged/followed %d blogs (%d skipped). Total tracked: %d\n",
@@ -82,55 +87,70 @@ func runFollowLikers() {
 
 func loadFollowConfig() FollowConfig {
 	cfg := FollowConfig{
-		BlogSearchQueries:   []string{"brat", "onlyfans", "fansly", "thirst trap"},
-		Queries:             []string{"nsfw", "horny", "thirst trap", "onlyfans"},
-		SeedBlogs:           nil,
-		MaxPosts:            5,
-		MaxFollows:          8,
-		DelaySeconds:        55,
-		DelayJitterSeconds:  40,
-		RequireActiveDays:   21,
-		PreferMale:          true,
-		SkipIfFemaleSignals: true,
-		IncludeRebloggers:   true,
-		PreferRebloggers:    true,
-		EngageBeforeFollow:  true,
-		ReblogTheirPosts:    1,
-		LikePinned:          true,
-		LikeExtraPosts:      2,
-		LikeDelaySeconds:    10,
-		SeedPostsPerBlog:    5,
-		BlogsPerSearch:      15,
-		SeedOnly:            true,
-		MinNotes:            5,
-		MaxNotes:            2000,
+		BlogSearchQueries:       []string{"brat", "onlyfans", "fansly", "thirst trap"},
+		Queries:                 []string{"nsfw", "horny", "thirst trap", "onlyfans"},
+		SeedBlogs:               nil,
+		MaxPosts:                3,
+		MaxFollows:              4,
+		DelaySeconds:            110,
+		DelayJitterSeconds:      90,
+		RequireActiveDays:       21,
+		PreferMale:              true,
+		SkipIfFemaleSignals:     true,
+		IncludeRebloggers:       true,
+		PreferRebloggers:        true,
+		EngageBeforeFollow:      true,
+		ReblogTheirPosts:        1,
+		LikePinned:              true,
+		LikeExtraPosts:          1,
+		LikeDelaySeconds:        14,
+		LikeDelayJitterSeconds:  18,
+		SeedPostsPerBlog:        4,
+		BlogsPerSearch:          8,
+		SeedOnly:                true,
+		MinNotes:                20,
+		MaxNotes:                100000,
+		FollowAfterEngageChance: 0.55,
+		SkipEngagerChance:       0.35,
 	}
 	if raw, err := os.ReadFile(followConfigFile); err == nil {
 		_ = json.Unmarshal(raw, &cfg)
 	}
 	if cfg.MaxPosts <= 0 {
-		cfg.MaxPosts = 5
+		cfg.MaxPosts = 3
 	}
 	if cfg.MaxFollows <= 0 {
-		cfg.MaxFollows = 8
+		cfg.MaxFollows = 4
 	}
 	if cfg.DelaySeconds <= 0 {
-		cfg.DelaySeconds = 55
+		cfg.DelaySeconds = 110
 	}
 	if cfg.DelayJitterSeconds < 0 {
 		cfg.DelayJitterSeconds = 0
 	}
-	if cfg.LikeExtraPosts <= 0 {
-		cfg.LikeExtraPosts = 2
+	if cfg.LikeExtraPosts < 0 {
+		cfg.LikeExtraPosts = 1
+	}
+	if cfg.LikeDelaySeconds <= 0 {
+		cfg.LikeDelaySeconds = 14
+	}
+	if cfg.LikeDelayJitterSeconds < 0 {
+		cfg.LikeDelayJitterSeconds = 0
+	}
+	if cfg.FollowAfterEngageChance <= 0 {
+		cfg.FollowAfterEngageChance = 0.55
+	}
+	if cfg.SkipEngagerChance < 0 {
+		cfg.SkipEngagerChance = 0
 	}
 	if cfg.ReblogTheirPosts < 0 {
 		cfg.ReblogTheirPosts = 0
 	}
 	if cfg.SeedPostsPerBlog <= 0 {
-		cfg.SeedPostsPerBlog = 5
+		cfg.SeedPostsPerBlog = 4
 	}
 	if cfg.BlogsPerSearch <= 0 {
-		cfg.BlogsPerSearch = 15
+		cfg.BlogsPerSearch = 8
 	}
 	if len(cfg.BlogSearchQueries) == 0 && len(cfg.Queries) > 0 {
 		cfg.BlogSearchQueries = append([]string{}, cfg.Queries...)
@@ -222,6 +242,10 @@ func engageForReachBurst(client *http.Client, auth *Auth, cfg FollowConfig, alre
 				if strings.EqualFold(blog, post.Blog) {
 					continue
 				}
+				// Humans don't engage every name in the notes list.
+				if cfg.SkipEngagerChance > 0 && rand.Float64() < cfg.SkipEngagerChance {
+					continue
+				}
 
 				fr := shouldFollowBlog(client, *auth, blog, cfg)
 				if !fr.OK {
@@ -238,17 +262,32 @@ func engageForReachBurst(client *http.Client, auth *Auth, cfg FollowConfig, alre
 					continue
 				}
 
+				// Open their blog first (real browser path).
+				peekBlog(client, *auth, blog)
+				humanThink()
+
+				doFollow := cfg.FollowAfterEngageChance >= 1 || rand.Float64() < cfg.FollowAfterEngageChance
+
 				if cfg.EngageBeforeFollow {
 					likePinnedAndRecent(client, auth, blog, cfg)
-					time.Sleep(time.Duration(randRange(5, 14)) * time.Second)
+					humanPause(8, 22)
 
-					if cfg.ReblogTheirPosts > 0 {
+					// Not every visit gets a reblog.
+					if cfg.ReblogTheirPosts > 0 && rand.Float64() < 0.65 {
 						n := reblogFromBlog(client, auth, blog, cfg.ReblogTheirPosts, reblogged)
 						if n > 0 {
 							_ = saveStringSet("data/reblogged.json", reblogged)
 						}
-						time.Sleep(time.Duration(randRange(8, 20)) * time.Second)
+						humanPause(12, 35)
 					}
+				}
+
+				if !doFollow {
+					fmt.Printf("  liked/browsed %s — not following this time\n", blog)
+					already[key] = true // don't re-hit same blog immediately
+					_ = saveFollowed(already)
+					humanPause(25, 70)
+					continue
 				}
 
 				fmt.Printf("  soft-follow: %s\n", blog)
@@ -293,10 +332,12 @@ func engageForReachBurst(client *http.Client, auth *Auth, cfg FollowConfig, alre
 		seedPosts, err := fetchBlogPosts(client, *auth, blog, cfg.SeedPostsPerBlog)
 		if err != nil {
 			fmt.Println("  posts error:", err)
+			humanPause(8, 20)
 			continue
 		}
 		if len(seedPosts) == 0 {
 			fmt.Println("  no posts found")
+			humanPause(5, 14)
 			continue
 		}
 		sortScrapedByNotes(seedPosts)
@@ -306,6 +347,10 @@ func engageForReachBurst(client *http.Client, auth *Auth, cfg FollowConfig, alre
 		}
 		fmt.Printf("  using %d of their posts as engagement sources\n", len(seedPosts))
 		processPosts(blog, seedPosts)
+		// Pause between seed blogs like a person hopping around.
+		if followed < maxFollows && !stop {
+			humanPause(40, 120)
+		}
 	}
 
 	if !stop && !cfg.SeedOnly && followed < maxFollows {
@@ -708,7 +753,7 @@ func followBlog(client *http.Client, auth Auth, blog string) error {
 	setCommonHeaders(req, auth)
 	req.Header.Set("Content-Type", "application/json; charset=utf8")
 	req.Header.Set("X-CSRF", auth.CSRF)
-	req.Header.Set("Referer", "https://www.tumblr.com/dashboard")
+	req.Header.Set("Referer", "https://www.tumblr.com/"+strings.TrimSuffix(blog, ".tumblr.com"))
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -730,8 +775,12 @@ func followDelay(cfg FollowConfig) int {
 	if cfg.DelayJitterSeconds > 0 {
 		wait += rand.Intn(cfg.DelayJitterSeconds + 1)
 	}
-	if wait < 5 {
-		wait = 5
+	if wait < 45 {
+		wait = 45
+	}
+	// Rare long break — looks like leaving the phone down.
+	if rand.Float64() < 0.08 {
+		wait += randRange(60, 180)
 	}
 	return wait
 }

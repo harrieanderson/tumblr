@@ -44,20 +44,31 @@ func loadCredentials() (Credentials, error) {
 }
 
 func chromePath() (string, error) {
-	candidates := []string{
-		os.Getenv("PROGRAMFILES") + `\Google\Chrome\Application\chrome.exe`,
-		os.Getenv("PROGRAMFILES(X86)") + `\Google\Chrome\Application\chrome.exe`,
-		os.Getenv("LOCALAPPDATA") + `\Google\Chrome\Application\chrome.exe`,
+	var candidates []string
+	if p, err := exec.LookPath("chrome.exe"); err == nil {
+		candidates = append(candidates, p)
 	}
+	if p, err := exec.LookPath("chrome"); err == nil {
+		candidates = append(candidates, p)
+	}
+	candidates = append(candidates,
+		os.Getenv("PROGRAMFILES")+`\Google\Chrome\Application\chrome.exe`,
+		os.Getenv("ProgramFiles(x86)")+`\Google\Chrome\Application\chrome.exe`,
+		os.Getenv("LOCALAPPDATA")+`\Google\Chrome\Application\chrome.exe`,
+		os.Getenv("PROGRAMFILES")+`\Google\Chrome Beta\Application\chrome.exe`,
+		os.Getenv("LOCALAPPDATA")+`\Google\Chrome Beta\Application\chrome.exe`,
+	)
+	seen := map[string]bool{}
 	for _, p := range candidates {
-		if p == "" {
+		if p == "" || strings.HasPrefix(p, `\`) || seen[p] {
 			continue
 		}
+		seen[p] = true
 		if _, err := os.Stat(p); err == nil {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("chrome.exe not found")
+	return "", fmt.Errorf("chrome.exe not found — install Google Chrome from https://www.google.com/chrome/")
 }
 
 func profileDir() (string, error) {
@@ -165,15 +176,21 @@ func loginWithRealChrome(auth *Auth) error {
 	if err := saveAuth(*auth); err != nil {
 		return err
 	}
-	fmt.Println("Synced cookies.")
+	fmt.Println("Synced cookies. You can close the bot Chrome window.")
 
 	client := newHumanClient()
 	if err := refreshCSRF(client, auth); err != nil {
 		fmt.Println("CSRF refresh warning:", err)
 	}
 	if name, err := syncAuthIdentity(client, auth); err != nil {
-		fmt.Println("Could not detect blog identity yet:", err)
-		fmt.Println("You can set config/auth.json \"blog\" manually to your t:… UUID")
+		// Fall back to laptop-setup helper (blog name) if UUID sync fails.
+		maybeFillBlog(client, auth)
+		if name2, err2 := syncAuthIdentity(client, auth); err2 != nil {
+			fmt.Println("Could not detect blog identity yet:", err)
+			fmt.Println("You can set config/auth.json \"blog\" manually to your t:… UUID")
+		} else {
+			fmt.Println("Active blog:", name2, "("+auth.Blog+")")
+		}
 	} else {
 		fmt.Println("Active blog:", name, "("+auth.Blog+")")
 	}

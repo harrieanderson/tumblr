@@ -14,6 +14,11 @@ const (
 )
 
 func main() {
+	if err := prepareWorkspace(); err != nil {
+		fmt.Println("Setup error:", err)
+		return
+	}
+
 	loginOnly := false
 	guiOnly := false
 	sessionOnly := false
@@ -88,6 +93,11 @@ func main() {
 			return
 		}
 		fmt.Println("Login OK — ready. Run go run . for a session, or go run . -messages to check inbox.")
+		return
+	}
+
+	if !blogConfigured(auth.Blog) && !guiOnly {
+		fmt.Println("Set your Tumblr blog name in config/auth.json, or run: go run . -login")
 		return
 	}
 
@@ -258,15 +268,17 @@ func runTextQueue() {
 // ensureSession refreshes CSRF, and if that fails, re-pulls cookies from the
 // chrome-data profile then retries. Only fails if Tumblr fully logged that profile out.
 func ensureSession(client *http.Client, auth *Auth) error {
-	if err := refreshCSRF(client, auth); err == nil {
-		return nil
+	if err := refreshCSRF(client, auth); err != nil {
+		fmt.Println("CSRF/cookie failed — re-syncing from Chrome profile...")
+		if err := syncCookiesFromChrome(auth); err != nil {
+			return err
+		}
+		if err := refreshCSRF(client, auth); err != nil {
+			return err
+		}
 	}
-
-	fmt.Println("CSRF/cookie failed — re-syncing from Chrome profile...")
-	if err := syncCookiesFromChrome(auth); err != nil {
-		return err
-	}
-	return refreshCSRF(client, auth)
+	maybeFillBlog(client, auth)
+	return nil
 }
 
 func waitWithKeepAlive(client *http.Client, auth *Auth, total time.Duration) error {

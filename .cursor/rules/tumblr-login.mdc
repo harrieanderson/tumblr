@@ -1,0 +1,31 @@
+---
+description: Preserve the real-Chrome multi-account Tumblr login flow. Reuse it; do not replace it.
+alwaysApply: true
+---
+
+# Tumblr login (keep this)
+
+This is the login Harrie wants reused. Do not replace it with cookie-paste, Puppeteer, a shared Chrome profile, or skipping Chrome when `auth.json` already exists.
+
+## How it works
+
+1. Accounts live in gitignored `config/credentials.json` as `"email": "password"` pairs. ID is the email local-part slug (`iyasoriano0320@gmail.com` → `iyasoriano0320`).
+2. Each account is isolated:
+   - Chrome: `chrome-data/profiles/{id}/`
+   - cookies: `config/profiles/{id}/auth.json`
+   - bot state: `data/profiles/{id}/`
+   - remote-debug port: `9333 + account index` (`currentDebugPort()`)
+3. Entry point: `loginWithRealChrome` → `startChromeLoggedIn` in `chrome.go`.
+   - Launch Chrome with that profile dir + debug port, open `https://www.tumblr.com/login`.
+   - If `sid` already exists, skip the form and sync cookies.
+   - Else chromedp auto-fills email/password (`fillTumblrLoginFormJS`). Wait for captcha/2FA in the real window if needed.
+   - Require `sid`, save cookies, refresh CSRF, set primary blog via `syncAuthIdentity`.
+   - `-login` then closes Chrome. Age-verify (`-safe-mode-off`) keeps the same Chrome open.
+4. Run: `login.bat`, `tumblr.exe -login` (every enabled account), or `-login -account ID`. GUI: profile dropdown + Login this / Login all.
+
+## Do not break
+
+- Always log in through `startChromeLoggedIn` for that account. Never attach to the user's everyday Chrome, and never reuse another profile's cookies because `auth.json` already has a `sid`.
+- One Chrome debug port per account. Do not run two logins on the same port.
+- Never print or commit `sid`, cookies, CSRF, or passwords.
+- Flag order: `-login` / `-safe-mode-off` are parsed from the full argv; do not assume `args[0]` is the action when `-account` comes first.

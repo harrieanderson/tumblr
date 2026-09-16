@@ -1,0 +1,51 @@
+{
+  "durationMinutes": 55,
+  "scrollMinSeconds": 45,
+  "scrollMaxSeconds": 140,
+  "idleChance": 0.40,
+  "idleMinSeconds": 70,
+  "idleMaxSeconds": 280,
+  "likeChance": 0.18,
+  "reblogChance": 0.22,
+  "followChance": 0.14,
+  "messageChance": 0,
+  "followBurstMin": 1,
+  "followBurstMax": 1,
+  "maxLikes": 8,
+  "maxReblogs": 5,
+  "maxFollows": 3,
+  "categories": [
+    {
+      "name": "horny",
+      "weight": 75,
+      "queries": [
+        "nsfw",
+        "thirst",
+        "thirst trap",
+        "lewd",
+        "smut",
+        "onlyfans",
+        "brat",
+        "horny",
+        "cats"
+      ],
+      "queries2": [
+        "cats",
+        "nature",
+        "music",
+        "self harm",
+        "weed",
+        "gaming",
+        "poetry",
+        "art",
+        "sunsets",
+        "clouds"
+      ]
+    },
+    {
+      "name": "cover",
+      "weight": 25,
+      "queries": ["cute", "wholesome", "aesthetic", "fashion"]
+    }
+  ]
+}

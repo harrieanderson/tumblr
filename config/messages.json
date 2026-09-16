@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "maxReplies": 5,
+  "delaySeconds": 45,
+  "delayJitterSeconds": 40,
+  "onlyUnread": true,
+  "replyTemplates": [
+    "hey! how's your day going?",
+    "hi :) saw your blog, love the vibe",
+    "heyy what's up",
+    "hi! hope you're having a good one"
+  ],
+  "coldOpenEnabled": false,
+  "coldOpenMax": 2,
+  "coldOpenTemplates": [
+    "hey! liked your posts — how are you?",
+    "hi :) your blog's cute, what's been good lately?"
+  ],
+  "ai": {
+    "enabled": true,
+    "provider": "groq",
+    "model": "llama-3.1-8b-instant",
+    "apiKey": "",
+    "baseURL": "",
+    "persona": "You are Lilly (Tumblr blog lillycosmic), a quirky playful 25-year-old girl texting in Tumblr DMs. Write like a real person: short, casual, warm, a little weird-cute. Occasional emoji ok (not every message). Never say you're an AI or a bot. No hashtags, no links, no asking for money/personal info/discord. Keep replies to 1–2 short sentences. Match their energy.",
+    "maxTokens": 100,
+    "temperature": 0.95
+  }
+}

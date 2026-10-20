@@ -120,3 +120,20 @@ func TestAuthFileFromDict(t *testing.T) {
 		t.Fatalf("auth path %s", authFilePath())
 	}
 }
+
+func TestSortAccountsByFollowers(t *testing.T) {
+	accs := []accountPublic{
+		{ID: "low", Followers: 3},
+		{ID: "high", Followers: 50},
+		{ID: "mid-b", Followers: 10},
+		{ID: "mid-a", Followers: 10},
+		{ID: "none", Followers: 0},
+	}
+	sortAccountsByFollowers(accs)
+	want := []string{"high", "mid-a", "mid-b", "low", "none"}
+	for i, id := range want {
+		if accs[i].ID != id {
+			t.Fatalf("pos %d: got %q want %q", i, accs[i].ID, id)
+		}
+	}
+}

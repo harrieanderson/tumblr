@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func reblogPost(client *http.Client, auth Auth, p ScrapedPost) error {
@@ -60,4 +61,74 @@ func reblogPost(client *http.Client, auth Auth, p ScrapedPost) error {
 	}
 	fmt.Println("  reblogged", p.Blog+"/"+p.ID, "->", resp.Status)
 	return nil
+}
+
+func runProbeReblog() {
+	auth, err := loadAuth()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("syncing cookies from chrome…")
+	if err := syncCookiesFromChrome(&auth); err != nil {
+		fmt.Println("cookie sync:", err)
+	}
+	client := &http.Client{Timeout: 45 * time.Second}
+	if err := ensureSession(client, &auth); err != nil {
+		fmt.Println("session:", err)
+		fmt.Println("trying login…")
+		if err := loginWithRealChrome(&auth); err != nil {
+			fmt.Println("login fail:", err)
+			return
+		}
+		if err := ensureSession(client, &auth); err != nil {
+			fmt.Println("session still dead:", err)
+			return
+		}
+	}
+	blog, _ := syncAuthIdentity(client, &auth)
+	if usableBlogName(blog) {
+		fmt.Println("as", blog)
+	}
+
+	seed := "madamedesiderio"
+	if cfg := loadFollowConfig(); len(cfg.SeedBlogs) > 0 {
+		seed = normalizeSeedBlogs(cfg.SeedBlogs)[0]
+	}
+	posts, err := fetchBlogPosts(client, &auth, seed, 5)
+	if err != nil || len(posts) == 0 {
+		fmt.Println("fetch posts:", err)
+		return
+	}
+	var p ScrapedPost
+	for _, cand := range posts {
+		if cand.ID == "" {
+			continue
+		}
+		if cand.ReblogKey == "" {
+			if enriched, e2 := fetchSinglePost(client, auth, cand); e2 == nil {
+				cand = enriched
+			}
+		}
+		if cand.ReblogKey != "" {
+			p = cand
+			break
+		}
+	}
+	if p.ID == "" || p.ReblogKey == "" {
+		fmt.Println("no reblogable post on", seed)
+		return
+	}
+	fmt.Println("target", p.Blog+"/"+p.ID)
+
+	if err := likePost(client, auth, p.ID, p.ReblogKey); err != nil {
+		fmt.Println("like: FAIL", err)
+	} else {
+		fmt.Println("like: OK")
+	}
+	if err := reblogPost(client, auth, p); err != nil {
+		fmt.Println("reblog: FAIL", err)
+	} else {
+		fmt.Println("reblog: OK")
+	}
 }

@@ -21,6 +21,8 @@ type ScrapedPost struct {
 	Notes      int    `json:"notes"`
 	Summary    string `json:"summary"`
 	Timestamp  int64  `json:"timestamp"`
+	SourceKind string `json:"sourceKind,omitempty"` // "seed" or "tag"
+	Source     string `json:"source,omitempty"`     // seed blog or tag query
 }
 
 func runScrape() {
@@ -30,7 +32,7 @@ func runScrape() {
 		return
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newAuthClient(&auth)
 	if err := ensureSession(client, &auth); err != nil {
 		fmt.Println("Session error:", err)
 		fmt.Println("Try: go run . -login")

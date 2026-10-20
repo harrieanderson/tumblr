@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,9 +20,72 @@ type LikeTarget struct {
 	Summary   string
 }
 
+const likeLimitFile = "data/like-limit.json"
+
+var (
+	likeLimitMu    sync.Mutex
+	likeLimitNoted sync.Map
+)
+
+// isDailyLikeLimit reports Tumblr's daily like cap: HTTP 429 with error code
+// 1040. The cap lifts on its own, so this only pauses likes for the day.
+func isDailyLikeLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if !strings.Contains(s, "429") && !strings.Contains(s, "too many requests") {
+		return false
+	}
+	return strings.Contains(s, "daily like limit") ||
+		strings.Contains(s, "limit exceeded") ||
+		strings.Contains(s, `"code":1040`)
+}
+
+func likeLimitDay() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// likeLimitReached reports whether this account already hit the cap today.
+func likeLimitReached(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	likeLimitMu.Lock()
+	defer likeLimitMu.Unlock()
+	return loadNameMap(likeLimitFile)[accountSlug(id)] == likeLimitDay()
+}
+
+// markLikeLimited stops likes for this account until tomorrow. Follows keep
+// running, and nothing about the account is deleted or disabled.
+func markLikeLimited(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	likeLimitMu.Lock()
+	defer likeLimitMu.Unlock()
+	m := loadNameMap(likeLimitFile)
+	m[accountSlug(id)] = likeLimitDay()
+	saveNameMap(likeLimitFile, m)
+}
+
+// noteLikeLimitOnce keeps the cap from filling the log the way the 429 body did.
+func noteLikeLimitOnce(id string, logFn func(string)) {
+	if _, seen := likeLimitNoted.LoadOrStore(id+"|"+likeLimitDay(), true); seen {
+		return
+	}
+	accLog(id, logFn, "   daily like limit reached — no more likes/engages today")
+}
+
 // likePinnedAndRecent likes 3–4 of a blog's posts (pinned first, then recent).
 func likePinnedAndRecent(client *http.Client, auth *Auth, blog string, cfg FollowConfig, logID string, logFn func(string)) error {
 	if !cfg.LikePinned && cfg.LikeExtraPosts <= 0 {
+		return nil
+	}
+	if likeLimitReached(logID) {
+		noteLikeLimitOnce(logID, logFn)
 		return nil
 	}
 
@@ -60,22 +124,33 @@ func likePinnedAndRecent(client *http.Client, auth *Auth, blog string, cfg Follo
 		if t.Pinned {
 			label = "pinned"
 		}
-		accLog(logID, logFn, "   liking %s %s (%s)", label, t.ID, truncate(t.Summary, 40))
+		accLog(logID, logFn, "   liking %s %s on @%s (%s)", label, t.ID, blog, truncate(t.Summary, 40))
 		if cfg.DryRun {
 			continue
 		}
 		if err := likePost(client, *auth, t.ID, t.ReblogKey); err != nil {
+			if isDailyLikeLimit(err) {
+				markLikeLimited(logID)
+				noteLikeLimitOnce(logID, logFn)
+				return nil
+			}
 			accLog(logID, logFn, "    like fail: %v", err)
 			err = retryAfterCookie(client, auth, logFn, logID, err, func() error {
 				return likePost(client, *auth, t.ID, t.ReblogKey)
 			})
 			if err != nil {
+				if isDailyLikeLimit(err) {
+					markLikeLimited(logID)
+					noteLikeLimitOnce(logID, logFn)
+					return nil
+				}
 				if isCookieProblem(err) {
 					return err
 				}
 				continue
 			}
 		}
+		accLog(logID, logFn, "   liked %s on @%s", label, blog)
 		if i < len(targets)-1 {
 			wait := delay
 			if jitter > 0 {
@@ -176,6 +251,10 @@ func isPinnedPost(m map[string]any) bool {
 }
 
 func fetchBlogPostsRaw(client *http.Client, auth *Auth, blog string, limit int) ([]map[string]any, error) {
+	return fetchBlogPostsPage(client, auth, blog, limit, 0)
+}
+
+func fetchBlogPostsPage(client *http.Client, auth *Auth, blog string, limit, offset int) ([]map[string]any, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("missing auth")
 	}
@@ -185,6 +264,9 @@ func fetchBlogPostsRaw(client *http.Client, auth *Auth, blog string, limit int) 
 	}
 	u := fmt.Sprintf("https://www.tumblr.com/api/v2/blog/%s/posts?limit=%d&npf=true",
 		url.PathEscape(blogID), limit)
+	if offset > 0 {
+		u += fmt.Sprintf("&offset=%d", offset)
+	}
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err

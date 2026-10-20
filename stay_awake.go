@@ -41,10 +41,15 @@ func parseForArg(s string) (time.Duration, error) {
 
 func setSessionFor(d time.Duration) {
 	if d <= 0 {
+		clearSessionUntil()
 		return
 	}
 	sessionUntil = time.Now().Add(d)
 	fmt.Printf("This run will stop at %s (~%s).\n", sessionUntil.Format("15:04"), d.Round(time.Minute))
+}
+
+func clearSessionUntil() {
+	sessionUntil = time.Time{}
 }
 
 func sessionExpired() bool {

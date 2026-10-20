@@ -83,6 +83,10 @@ func saveAuth(auth Auth) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
+	if err := checkSessionOwnerBeforeSave(path, auth); err != nil {
+		fmt.Println(err)
+		return err
+	}
 	data, err := json.MarshalIndent(auth, "", "  ")
 	if err != nil {
 		return err
@@ -258,9 +262,74 @@ func syncAuthIdentity(client *http.Client, auth *Auth) (blogName string, err err
 	if uuid == "" {
 		return "", fmt.Errorf("no blog uuid in user/info")
 	}
+	if err := rejectForeignBlogSession(auth, name); err != nil {
+		clearAuthSession(auth)
+		_ = saveAuth(*auth)
+		return "", err
+	}
 	auth.Blog = uuid
 	if err := saveAuth(*auth); err != nil {
 		return name, err
 	}
 	return name, nil
+}
+
+// rejectForeignBlogSession blocks saving a Tumblr session whose primary blog
+// is another account's assigned username (cookie mix across profiles).
+func rejectForeignBlogSession(auth *Auth, primaryName string) error {
+	id := accountIDFromAuth(*auth)
+	primaryName = normalizeBlogName(primaryName)
+	if id == "" || primaryName == "" {
+		return nil
+	}
+	want := assignedBlogName(id)
+	if want != "" && want == primaryName {
+		return nil
+	}
+	for otherID, otherName := range loadNameMap(assignedUsernamesFile) {
+		otherID = accountSlug(otherID)
+		otherName = normalizeBlogName(otherName)
+		if otherID == "" || otherName == "" || otherID == id {
+			continue
+		}
+		if otherName == primaryName {
+			label := "its own blog"
+			if want != "" {
+				label = "@" + want
+			}
+			return foreignBlogSessionError{
+				AccountID: id,
+				GotBlog:   primaryName,
+				OwnerID:   otherID,
+				WantBlog:  label,
+			}
+		}
+	}
+	return nil
+}
+
+type foreignBlogSessionError struct {
+	AccountID string
+	GotBlog   string
+	OwnerID   string
+	WantBlog  string
+}
+
+func (e foreignBlogSessionError) Error() string {
+	return fmt.Sprintf("session is @%s (account %s) — not %s; run -login for this account", e.GotBlog, e.OwnerID, e.WantBlog)
+}
+
+func isForeignBlogSession(err error) bool {
+	_, ok := err.(foreignBlogSessionError)
+	return ok
+}
+
+func clearAuthSession(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	auth.Cookie = ""
+	auth.Blog = ""
+	auth.CSRF = ""
+	auth.Bearer = ""
 }

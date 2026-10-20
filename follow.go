@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/rand"
 	"net/http"
@@ -29,9 +30,13 @@ type FollowConfig struct {
 	IncludeRebloggers      bool     `json:"includeRebloggers"`
 	PreferRebloggers       bool     `json:"preferRebloggers"`
 	EngageBeforeFollow     bool     `json:"engageBeforeFollow"`
-	ReblogTheirPosts       int      `json:"reblogTheirPosts"`
-	ReblogChance           float64  `json:"reblogChance"`
-	LikePinned             bool     `json:"likePinned"`
+	ReblogTheirPosts       int      `json:"reblogTheirPosts"` // legacy; prefer NSFWReblog for engager posts
+	ReblogChance           float64  `json:"reblogChance"`    // legacy engager reblog chance
+	// Soft public trail (nature/cats/girly) vs rare NSFW engager reblogs.
+	TrailReblog            trailReblogConfig `json:"trailReblog"`
+	NSFWReblog             nsfwReblogConfig  `json:"nsfwReblog"`
+	ReblogEngagerPosts     *bool             `json:"reblogEngagerPosts"` // nil/false = only via NSFW quota
+	LikePinned             bool              `json:"likePinned"`
 	LikeExtraPosts         int      `json:"likeExtraPosts"`
 	LikePostsMin           int      `json:"likePostsMin"`
 	LikePostsMax           int      `json:"likePostsMax"`
@@ -47,6 +52,42 @@ type FollowConfig struct {
 	FollowAfterEngageChance float64 `json:"followAfterEngageChance"`
 	SkipEngagerChance       float64 `json:"skipEngagerChance"`
 	MaxEngages              int     `json:"maxEngages"`
+	likerShard              int
+	likerShards             int
+	// stopAfter: optional local deadline for short bursts (e.g. messaging idle reach).
+	// Does not change the global sessionUntil used by -for.
+	stopAfter time.Time
+}
+
+func (cfg FollowConfig) timeUp() bool {
+	if sessionExpired() {
+		return true
+	}
+	return !cfg.stopAfter.IsZero() && !time.Now().Before(cfg.stopAfter)
+}
+
+// sleepUpTo sleeps waitSec but cuts short when stopAfter / session deadline hits.
+func (cfg FollowConfig) sleepUpTo(waitSec int) {
+	if waitSec <= 0 {
+		return
+	}
+	end := time.Now().Add(time.Duration(waitSec) * time.Second)
+	if !cfg.stopAfter.IsZero() && end.After(cfg.stopAfter) {
+		end = cfg.stopAfter
+	}
+	for time.Now().Before(end) {
+		if sessionExpired() || cfg.timeUp() {
+			return
+		}
+		slice := 2 * time.Second
+		if left := time.Until(end); left < slice {
+			slice = left
+		}
+		if slice <= 0 {
+			return
+		}
+		time.Sleep(slice)
+	}
 }
 
 type Engager struct {
@@ -65,7 +106,39 @@ func runFollowLikers() {
 	}
 }
 
+func likerBelongsToShard(name string, shard, shards int) bool {
+	if shards <= 1 {
+		return true
+	}
+	if shard < 0 || shard >= shards {
+		return false
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(strings.ToLower(strings.TrimSpace(name))))
+	return int(h.Sum32()%uint32(shards)) == shard
+}
+
+func shardIndexFor(id string, pool []Account) int {
+	for i, a := range pool {
+		if a.ID == id {
+			return i
+		}
+	}
+	// Accounts outside the pool (e.g. mid-reply accounts doing idle reach)
+	// must not all land on slice 0 and walk the same likers.
+	if len(pool) == 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(strings.ToLower(strings.TrimSpace(id))))
+	return int(h.Sum32() % uint32(len(pool)))
+}
+
 func runFollowLikersOn(acc Account, maxFollows, likePosts int, logFn func(string)) error {
+	return runFollowLikersOnUntil(acc, maxFollows, likePosts, time.Time{}, logFn)
+}
+
+func runFollowLikersOnUntil(acc Account, maxFollows, likePosts int, until time.Time, logFn func(string)) error {
 	quietChromeLogin = true
 	nativeChromeClicks = false
 	files := filesForAccount(acc.ID)
@@ -73,18 +146,26 @@ func runFollowLikersOn(acc Account, maxFollows, likePosts int, logFn func(string
 	if err != nil {
 		return fmt.Errorf("loading auth: %w", err)
 	}
+	if accountIsTerminated(files.ID) {
+		accLog(files.ID, logFn, "Tumblr terminated this account — skipping")
+		return nil
+	}
 	if !authHasSID(auth) {
 		return fmt.Errorf("not logged in")
 	}
+	release, holder, ok := tryLockAccount(files.ID, "reach")
+	if !ok {
+		accLog(files.ID, logFn, "another run (pid %d) is already doing reach on this account — skipping", holder)
+		return nil
+	}
+	defer release()
 
-	if sessionExpired() {
+	cfg := loadFollowConfig()
+	cfg.stopAfter = until
+	if cfg.timeUp() {
 		accLog(files.ID, logFn, "time is up")
 		return nil
 	}
-
-	cfg := loadFollowConfig()
-	cfg.PreferRebloggers = false
-	cfg.IncludeRebloggers = false
 	if maxFollows > 0 {
 		cfg.MaxFollows = maxFollows
 	}
@@ -97,21 +178,45 @@ func runFollowLikersOn(acc Account, maxFollows, likePosts int, logFn func(string
 		}
 		cfg.LikeExtraPosts = likePosts
 	}
+	if pool := likerShardPool(); len(pool) > 1 {
+		cfg.likerShards = len(pool)
+		cfg.likerShard = shardIndexFor(acc.ID, pool)
+		if cfg.likerShard >= cfg.likerShards {
+			cfg.likerShard = cfg.likerShard % cfg.likerShards
+		}
+		accLog(files.ID, logFn, "seed slice %d/%d so this blog fetches its own posts (likers are shared through the queue)", cfg.likerShard+1, cfg.likerShards)
+	}
+	if !until.IsZero() {
+		accLog(files.ID, logFn, "reach burst until %s", until.Format("15:04:05"))
+	}
 
-	client := newHumanClient()
+	client := newAuthClient(&auth)
 	if err := ensureSession(client, &auth); err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
-	warmSession(client, &auth)
+	warmSession(client, &auth, files.ID, logFn)
 
 	already, err := loadFollowedFile(files.Followed)
 	if err != nil {
 		return fmt.Errorf("followed list: %w", err)
 	}
 
-	accLog(files.ID, logFn, "Seed blogs + tagged posts → likes list → like them, sometimes follow")
+	accLog(files.ID, logFn, "Seed blogs first (like their likers), then tags if there is time")
 	n, skipped := engageTagLikers(client, &auth, cfg, already, cfg.MaxFollows, files, logFn)
 	_ = saveFollowedFile(files.Followed, already)
+
+	// Soft public trail: nature / cats / girly — separate from NSFW audience hunting.
+	reblogged := loadStringSet(files.Reblogged)
+	if reblogged == nil {
+		reblogged = map[string]bool{}
+	}
+	if !cfg.timeUp() {
+		accLog(files.ID, logFn, "%s", reblogPolicySummary(files.ID))
+		if runTrailReblogs(client, &auth, cfg, reblogged, files.ID, logFn) > 0 {
+			_ = saveStringSet(files.Reblogged, reblogged)
+		}
+	}
+
 	accLog(files.ID, logFn, "Done. Followed %d (%d skipped). Shared interacted: %d", n, skipped, interactedCount())
 	logOwnFollowers(client, &auth, logFn)
 	if cfg.DryRun {
@@ -125,16 +230,18 @@ func accLog(id string, extra func(string), format string, args ...any) {
 	if id != "" {
 		msg = "[" + id + "] " + msg
 	}
-	fmt.Println(msg)
 	if extra != nil {
 		extra(msg)
+		return
 	}
+	fmt.Println(msg)
 }
 
 func loadFollowConfig() FollowConfig {
 	cfg := FollowConfig{
 		BlogSearchQueries: []string{"brat", "onlyfans", "fansly", "thirst trap", "cnc kink", "brattysub", "big tiddy gf"},
 		Queries: []string{
+			"attention wh0r3",
 			"onlyfans", "fansly", "thirst trap", "bimbo slvt",
 			"looking for a daddy", "looking for daddy", "dm me daddy", "daddy bf",
 			"older man do it better", "older gentleman", "dm me if you want",
@@ -143,7 +250,11 @@ func loadFollowConfig() FollowConfig {
 			"brattysub", "bratty switch", "bratty princess", "slvtty brat", "dd/lg brat",
 			"big tittis", "big tiddy goth gf", "big tiddy gf", "big tiddy anime girl", "big boosb",
 		},
-		SeedBlogs:               []string{"madamedesiderio", "bby-devil-girl", "fawnjaw"},
+		SeedBlogs: []string{
+			"madamedesiderio", "bby-devil-girl", "fawnjaw",
+			"daddysbunnyslutt", "makeawishonlove", "melodyofalba",
+			"brunos-costa", "theonlygoddesss", "maria818noctis", "mistymacallister", "dirtnasty182",
+		},
 		MaxPosts:                20,
 		MaxFollows:              40,
 		DelaySeconds:            110,
@@ -151,8 +262,8 @@ func loadFollowConfig() FollowConfig {
 		RequireActiveDays:       21,
 		PreferMale:              true,
 		SkipIfFemaleSignals:     true,
-		IncludeRebloggers:       false,
-		PreferRebloggers:        false,
+		IncludeRebloggers:       true,
+		PreferRebloggers:        true,
 		EngageBeforeFollow:      true,
 		ReblogTheirPosts:        1,
 		ReblogChance:            0.35,
@@ -240,6 +351,33 @@ func loadFollowConfig() FollowConfig {
 	if cfg.MaxNotes > 0 && cfg.MaxNotes < cfg.MinNotes {
 		cfg.MaxNotes = cfg.MinNotes
 	}
+	if !cfg.TrailReblog.Enabled && len(cfg.TrailReblog.Queries) == 0 && len(cfg.TrailReblog.SeedBlogs) == 0 {
+		cfg.TrailReblog = defaultTrailReblogConfig()
+	} else {
+		if cfg.TrailReblog.PerSession <= 0 {
+			cfg.TrailReblog.PerSession = 2
+		}
+		if cfg.TrailReblog.Chance <= 0 {
+			cfg.TrailReblog.Chance = 0.85
+		}
+		if len(cfg.TrailReblog.Queries) == 0 {
+			cfg.TrailReblog.Queries = defaultTrailReblogConfig().Queries
+		}
+		cfg.TrailReblog.Enabled = true
+	}
+	if cfg.NSFWReblog.MaxCount == 0 && cfg.NSFWReblog.WindowHours == 0 && cfg.NSFWReblog.Chance == 0 {
+		cfg.NSFWReblog = defaultNSFWReblogConfig()
+	} else {
+		if cfg.NSFWReblog.WindowHours <= 0 {
+			cfg.NSFWReblog.WindowHours = 72
+		}
+		if cfg.NSFWReblog.MaxCount < 0 {
+			cfg.NSFWReblog.MaxCount = 0
+		}
+		if cfg.NSFWReblog.Chance < 0 {
+			cfg.NSFWReblog.Chance = 0
+		}
+	}
 	return cfg
 }
 
@@ -254,8 +392,6 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 	if maxFollows <= 0 {
 		return 0, 0
 	}
-	cfg.IncludeRebloggers = false
-	cfg.PreferRebloggers = false
 
 	id := files.ID
 	rememberBlogsFromAuth(client, auth)
@@ -264,58 +400,143 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 		maxEngages = maxFollows * 2
 	}
 
-	seedPosts := gatherSeedBlogPosts(client, auth, cfg, id, logFn)
-	tagPosts := gatherTagPosts(client, auth, cfg, id, logFn)
-	posts := append(seedPosts, tagPosts...)
-	if len(posts) == 0 {
-		accLog(id, logFn, "No posts found on seed blogs or tags")
-		return 0, 0
-	}
-	rand.Shuffle(len(posts), func(i, j int) { posts[i], posts[j] = posts[j], posts[i] })
-
-	accLog(id, logFn, "Walking %d posts for likers (up to %d follows / %d touches)", len(posts), maxFollows, maxEngages)
-	if sessionExpired() {
-		accLog(id, logFn, "time is up")
-		return followed, skipped
-	}
-	accLog(id, logFn, "Per liker: like their posts, sometimes follow. Shared skip list so other accounts leave them alone.")
-
 	reblogged := loadStringSet(files.Reblogged)
 	if reblogged == nil {
 		reblogged = map[string]bool{}
 	}
-	engaged := 0
-	stop := false
 
+	accLog(id, logFn, "Collecting seed-blog posts, then liking people who liked them")
+	seedPosts := gatherSeedBlogPosts(client, auth, cfg, id, logFn)
+	rand.Shuffle(len(seedPosts), func(i, j int) { seedPosts[i], seedPosts[j] = seedPosts[j], seedPosts[i] })
+	if cfg.timeUp() {
+		accLog(id, logFn, "time is up")
+		return 0, 0
+	}
+	accLog(id, logFn, "Per liker: like their posts, sometimes follow. Shared skip list so other accounts leave them alone.")
+	followed, skipped, engaged, stop := engagePostsLikers(client, auth, cfg, seedPosts, already, maxFollows, maxEngages, files, logFn, reblogged, 0, 0, 0)
+	if stop || engaged >= maxEngages || cfg.timeUp() || cfg.SeedOnly {
+		return followed, skipped
+	}
+
+	accLog(id, logFn, "Searching tags for more likers…")
+	tagPosts := gatherTagPosts(client, auth, cfg, id, logFn)
+	rand.Shuffle(len(tagPosts), func(i, j int) { tagPosts[i], tagPosts[j] = tagPosts[j], tagPosts[i] })
+	followed, skipped, _, _ = engagePostsLikers(client, auth, cfg, tagPosts, already, maxFollows, maxEngages, files, logFn, reblogged, followed, skipped, engaged)
+	return followed, skipped
+}
+
+func engagePostsLikers(client *http.Client, auth *Auth, cfg FollowConfig, posts []ScrapedPost, already map[string]bool, maxFollows, maxEngages int, files accountFiles, logFn func(string), reblogged map[string]bool, followed, skipped, engaged int) (int, int, int, bool) {
+	id := files.ID
+	stop := false
+	softSkip := map[string]bool{}
+	accLog(id, logFn, "Walking %d posts for likers (up to %d follows / %d touches) — %d people already waiting in the shared queue",
+		len(posts), maxFollows, maxEngages, likerQueueLen())
+
+	// The first pass takes people other accounts already queued before
+	// fetching any new post.
+	posts = append([]ScrapedPost{{SourceKind: "queue"}}, posts...)
 	for _, post := range posts {
-		if stop || engaged >= maxEngages || sessionExpired() {
+		if stop || engaged >= maxEngages || cfg.timeUp() {
 			break
 		}
-		accLog(id, logFn, "Likes on %s/%s (%d notes)…", post.Blog, post.ID, post.Notes)
-		names, err := fetchNotesByMode(client, auth, post.Blog, post.ID, "likes")
-		if err != nil {
-			err = retryAfterCookie(client, auth, logFn, id, err, func() error {
-				var e error
-				names, e = fetchNotesByMode(client, auth, post.Blog, post.ID, "likes")
-				return e
-			})
-			if err != nil {
-				accLog(id, logFn, "  likes list error: %v", err)
-				if isCookieProblem(err) {
-					_ = saveFollowedFile(files.Followed, already)
-					stop = true
-					break
+		if likeLimitReached(id) {
+			noteLikeLimitOnce(id, logFn)
+			accLog(id, logFn, "like-capped — stopping engages (no naked follows)")
+			break
+		}
+		if post.SourceKind != "queue" {
+			accLog(id, logFn, "Likes on %s/%s (%d notes)…", post.Blog, post.ID, post.Notes)
+		}
+		var names []string
+		var err error
+		if post.SourceKind == "queue" {
+			// nothing to fetch — just drain the shared queue below
+		} else if cfg.IncludeRebloggers || cfg.PreferRebloggers {
+			ranked, e := fetchEngagersRanked(client, *auth, post.Blog, post.ID, cfg)
+			err = e
+			if err != nil && (isCookieProblem(err) || isTransientNet(err)) {
+				err = retryAfterCookie(client, auth, logFn, id, err, func() error {
+					var e2 error
+					ranked, e2 = fetchEngagersRanked(client, *auth, post.Blog, post.ID, cfg)
+					return e2
+				})
+			}
+			if err == nil {
+				reb, lik := 0, 0
+				for _, e := range ranked {
+					names = append(names, e.Blog)
+					if e.Kind == "reblog" {
+						reb++
+					} else {
+						lik++
+					}
 				}
-				continue
+				accLog(id, logFn, "  found %d engagers (%d reblog / %d like)", len(names), reb, lik)
+			}
+		} else {
+			names, err = fetchNotesByMode(client, auth, post.Blog, post.ID, "likes")
+			if err != nil && (isCookieProblem(err) || isTransientNet(err)) {
+				err = retryAfterCookie(client, auth, logFn, id, err, func() error {
+					var e2 error
+					names, e2 = fetchNotesByMode(client, auth, post.Blog, post.ID, "likes")
+					return e2
+				})
+			}
+			if err == nil {
+				accLog(id, logFn, "  found %d likers", len(names))
 			}
 		}
-		rand.Shuffle(len(names), func(i, j int) { names[i], names[j] = names[j], names[i] })
-		accLog(id, logFn, "  found %d likers", len(names))
-
-		for _, name := range names {
-			if stop || engaged >= maxEngages || sessionExpired() {
+		if err != nil {
+			accLog(id, logFn, "  notes list error: %v", err)
+			if isCookieProblem(err) {
+				_ = saveFollowedFile(files.Followed, already)
+				stop = true
 				break
 			}
+			continue
+		}
+		if post.SourceKind == "seed" {
+			fresh := freshEngagers(names, post.Blog)
+			recordSeedPostFreshness(post.Blog, post.ID, fresh)
+			accLog(id, logFn, "  %d of them nobody has touched yet", fresh)
+		}
+		// Prefer-reblog order is intentional — only shuffle when not preferring.
+		if !cfg.PreferRebloggers {
+			rand.Shuffle(len(names), func(i, j int) { names[i], names[j] = names[j], names[i] })
+		}
+
+		if post.SourceKind != "queue" {
+			n := enqueueLikers(names, post)
+			accLog(id, logFn, "  queued %d new people for every account (%d waiting)", n, likerQueueLen())
+		}
+
+		// Cap takes per post (skips count too) so this account keeps walking
+		// its own seed posts and adds fresh blogs to the mix instead of
+		// draining one backlog for the whole run.
+		takeCap := 20
+		if post.SourceKind == "queue" {
+			takeCap = 10
+		}
+		for {
+			if stop || engaged >= maxEngages || cfg.timeUp() {
+				break
+			}
+			if takeCap == 0 {
+				break
+			}
+			takeCap--
+			if likeLimitReached(id) {
+				noteLikeLimitOnce(id, logFn)
+				accLog(id, logFn, "  like-capped — stopping engages (no naked follows)")
+				stop = true
+				break
+			}
+			q, ok := takeQueuedLiker()
+			if !ok {
+				break
+			}
+			name := q.Blog
+			post := q.asPost()
 			blog := strings.TrimSpace(name)
 			key := strings.ToLower(blog)
 			if blog == "" || already[key] || hasInteracted(blog) {
@@ -330,7 +551,7 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 				already[key] = true
 				continue
 			}
-			if cfg.SkipEngagerChance > 0 && rand.Float64() < cfg.SkipEngagerChance {
+			if softSkip[key] {
 				continue
 			}
 
@@ -338,6 +559,12 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 			if !fr.OK {
 				accLog(id, logFn, "  skip %s (%s)", blog, fr.Reason)
 				skipped++
+				// Soft rejects (gender/inactive) must NOT burn the shared interacted
+				// list — only remember them for this account's current pass.
+				if isSoftFollowReject(fr) {
+					softSkip[key] = true
+					continue
+				}
 				markInteracted(blog)
 				already[key] = true
 				continue
@@ -366,6 +593,10 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 
 			peekBlog(client, *auth, blog)
 			humanThink()
+			liked, didReblog := false, false
+			touch := func(followed bool) {
+				recordResearchTouch(id, blog, post, liked, didReblog, followed)
+			}
 			if err := likePinnedAndRecent(client, auth, blog, cfg, id, logFn); err != nil {
 				if isCookieProblem(err) {
 					accLog(id, logFn, "  stopping this account: %v", err)
@@ -373,26 +604,18 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 					stop = true
 					break
 				}
+			} else {
+				liked = true
 			}
 			humanPause(12, 28)
 
-			if cfg.ReblogTheirPosts > 0 {
-				chance := cfg.ReblogChance
-				if chance <= 0 {
-					chance = 0.35
-				}
-				if rand.Float64() < chance {
-					n, err := reblogFromBlog(client, auth, blog, cfg.ReblogTheirPosts, reblogged)
-					if err != nil && isCookieProblem(err) {
-						accLog(id, logFn, "  stopping this account: %v", err)
-						_ = saveFollowedFile(files.Followed, already)
-						stop = true
-						break
-					}
-					if n > 0 {
-						accLog(id, logFn, "   reblogged %d of their posts", n)
-						_ = saveStringSet(files.Reblogged, reblogged)
-					}
+			// Public trail stays soft. Engager reblogs are rare NSFW only
+			// (tracked per-account over nsfwReblog.windowHours).
+			allowEngagerReblog := cfg.ReblogEngagerPosts != nil && *cfg.ReblogEngagerPosts
+			if allowEngagerReblog || cfg.ReblogTheirPosts > 0 || cfg.NSFWReblog.MaxCount > 0 || cfg.NSFWReblog.Chance > 0 {
+				if maybeReblogEngagerPost(client, auth, cfg, blog, reblogged, id, logFn) {
+					didReblog = true
+					_ = saveStringSet(files.Reblogged, reblogged)
 					humanPause(12, 28)
 				}
 			}
@@ -404,6 +627,7 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 						return followBlog(client, *auth, blog)
 					})
 					if err != nil {
+						touch(false)
 						if isFollowRejected(err) {
 							accLog(id, logFn, "   Tumblr refused follow of %s — liked only", blog)
 							already[key] = true
@@ -424,8 +648,10 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 					}
 				}
 				followed++
+				recordFollowAttribution(id, blog, post.SourceKind, post.Source)
 				_ = saveFollowedFile(files.Followed, already)
 			}
+			touch(doFollow)
 
 			already[key] = true
 			engaged++
@@ -437,19 +663,33 @@ func engageTagLikers(client *http.Client, auth *Auth, cfg FollowConfig, already 
 				if paceFast() {
 					minLikeWait = 12
 				}
+				// Timed bursts (messaging between-chat / idle): don't force a 40s
+				// floor that burns the whole gap after one like.
+				if !cfg.stopAfter.IsZero() {
+					minLikeWait = 3
+					if left := int(time.Until(cfg.stopAfter).Seconds()) - 1; left < wait {
+						wait = left
+					}
+				}
 				if wait < minLikeWait {
 					wait = minLikeWait
 				}
 			}
-			accLog(id, logFn, "  waiting %ds…", wait)
-			time.Sleep(time.Duration(wait) * time.Second)
+			if wait > 0 {
+				accLog(id, logFn, "  waiting %ds…", wait)
+				cfg.sleepUpTo(wait)
+			}
 		}
-		if engaged < maxEngages && !stop {
-			humanPause(20, 50)
+		if engaged < maxEngages && !stop && !cfg.timeUp() {
+			if cfg.stopAfter.IsZero() {
+				humanPause(20, 50)
+			} else {
+				cfg.sleepUpTo(8)
+			}
 		}
 	}
 
-	return followed, skipped
+	return followed, skipped, engaged, stop
 }
 
 func gatherSeedBlogPosts(client *http.Client, auth *Auth, cfg FollowConfig, id string, logFn func(string)) []ScrapedPost {
@@ -459,38 +699,91 @@ func gatherSeedBlogPosts(client *http.Client, auth *Auth, cfg FollowConfig, id s
 	}
 	var posts []ScrapedPost
 	seen := map[string]bool{}
-	for _, seed := range normalizeSeedBlogs(cfg.SeedBlogs) {
-		accLog(id, logFn, "  blog: %s", seed)
-		batch, err := fetchBlogPosts(client, auth, seed, per+4)
-		if err != nil {
-			accLog(id, logFn, "   posts error: %v", err)
-			continue
-		}
-		sortScrapedByNotes(batch)
-		batch = filterPostsByNoteBand(batch, cfg.MinNotes, cfg.MaxNotes)
-		if len(batch) > per {
-			batch = batch[:per]
-		}
-		for _, p := range batch {
-			if p.ID == "" || seen[p.ID] {
-				continue
-			}
-			seen[p.ID] = true
-			posts = append(posts, p)
-		}
+	seeds := shardStringList(normalizeSeedBlogs(cfg.SeedBlogs), cfg.likerShard, cfg.likerShards)
+	accLog(id, logFn, "  %d seed blogs (shard %d/%d)…", len(seeds), cfg.likerShard+1, max(1, cfg.likerShards))
+	seeds, modes, tuned := tuneSourceOrder("seed", seeds, normalizeBlogName)
+	if tuned != "" {
+		accLog(id, logFn, "  %s", tuned)
 	}
+	for _, seed := range seeds {
+		if cfg.timeUp() {
+			accLog(id, logFn, "  seed gather — time is up")
+			break
+		}
+		want := tunedPostCount(per, modes[seed])
+		var picked []ScrapedPost
+		usedUp, depth := 0, 0
+		sessionDead := false
+		for offset := 0; offset < seedMaxDepth && len(picked) < want && !cfg.timeUp(); offset += seedPageSize {
+			var batch []ScrapedPost
+			var err error
+			fetch := func() error {
+				var e error
+				batch, e = fetchBlogPostsAt(client, auth, seed, seedPageSize, offset)
+				return e
+			}
+			err = fetch()
+			if err != nil && (isCookieProblem(err) || isTransientNet(err)) {
+				err = retryAfterCookie(client, auth, logFn, id, err, fetch)
+			}
+			if err != nil {
+				accLog(id, logFn, "   %s posts error: %v", seed, err)
+				sessionDead = isCookieProblem(err)
+				break
+			}
+			if len(batch) == 0 {
+				break
+			}
+			depth = offset + len(batch)
+			sortScrapedByNotes(batch)
+			for _, p := range filterPostsByNoteBand(batch, cfg.MinNotes, cfg.MaxNotes) {
+				if len(picked) >= want {
+					break
+				}
+				if p.ID == "" || seen[p.ID] {
+					continue
+				}
+				if p.Blog == "" {
+					p.Blog = seed
+				}
+				if seedPostUsedUp(p.Blog, p.ID) {
+					usedUp++
+					continue
+				}
+				seen[p.ID] = true
+				p.SourceKind = "seed"
+				p.Source = seed
+				picked = append(picked, p)
+			}
+			if len(batch) < seedPageSize {
+				break
+			}
+			time.Sleep(time.Duration(800+rand.Intn(1200)) * time.Millisecond)
+		}
+		if sessionDead {
+			accLog(id, logFn, "  stopping seed gather — session still dead")
+			break
+		}
+		if usedUp > 0 {
+			accLog(id, logFn, "   %s: %d posts picked, skipped %d used-up (looked %d posts back)", seed, len(picked), usedUp, depth)
+		}
+		posts = append(posts, picked...)
+	}
+	accLog(id, logFn, "  %d posts from seed blogs", len(posts))
 	return posts
 }
 
 func gatherTagPosts(client *http.Client, auth *Auth, cfg FollowConfig, id string, logFn func(string)) []ScrapedPost {
 	seen := map[string]bool{}
 	var posts []ScrapedPost
-	add := func(batch []ScrapedPost) {
+	add := func(batch []ScrapedPost, tag string) {
 		for _, p := range batch {
 			if p.Blog == "" || p.ID == "" || seen[p.ID] {
 				continue
 			}
 			seen[p.ID] = true
+			p.SourceKind = "tag"
+			p.Source = tag
 			posts = append(posts, p)
 		}
 	}
@@ -498,34 +791,117 @@ func gatherTagPosts(client *http.Client, auth *Auth, cfg FollowConfig, id string
 	if cfg.SeedPostsPerBlog > 0 && cfg.SeedPostsPerBlog < perTag {
 		perTag = cfg.SeedPostsPerBlog
 	}
-	for _, q := range cfg.Queries {
-		q = strings.TrimSpace(strings.TrimPrefix(q, "#"))
+	queries := shardStringList(cfg.Queries, cfg.likerShard, cfg.likerShards)
+	queries, modes, tuned := tuneSourceOrder("tag", queries, normalizeFollowQuery)
+	if tuned != "" {
+		accLog(id, logFn, "  %s", tuned)
+	}
+	nq := 0
+	for _, q := range queries {
+		if normalizeFollowQuery(q) != "" {
+			nq++
+		}
+	}
+	accLog(id, logFn, "  searching %d tags (shard %d/%d)…", nq, cfg.likerShard+1, max(1, cfg.likerShards))
+	for _, q := range queries {
+		if cfg.timeUp() {
+			accLog(id, logFn, "  tag gather — time is up")
+			break
+		}
+		want := tunedPostCount(perTag, modes[q])
+		q = normalizeFollowQuery(q)
 		if q == "" {
 			continue
 		}
-		accLog(id, logFn, "  tag: %s", q)
 		batch, err := scrapeTaggedPosts(client, *auth, q, 20)
+		if err != nil && (isCookieProblem(err) || isTransientNet(err)) {
+			err = retryAfterCookie(client, auth, logFn, id, err, func() error {
+				var e2 error
+				batch, e2 = scrapeTaggedPosts(client, *auth, q, 20)
+				return e2
+			})
+		}
 		if err != nil {
 			accLog(id, logFn, "   tagged search error: %v", err)
+			if isCookieProblem(err) {
+				accLog(id, logFn, "  stopping tag gather — session still dead")
+				break
+			}
 		}
 		if len(batch) == 0 {
 			if top, err := scrapeTopPosts(client, *auth, q, 15); err == nil {
 				batch = append(batch, top...)
+			} else if isCookieProblem(err) || isTransientNet(err) {
+				err = retryAfterCookie(client, auth, logFn, id, err, func() error {
+					var e2 error
+					top, e2 = scrapeTopPosts(client, *auth, q, 15)
+					if e2 == nil {
+						batch = append(batch, top...)
+					}
+					return e2
+				})
+				if err != nil && isCookieProblem(err) {
+					accLog(id, logFn, "   tagged search error: %v", err)
+					accLog(id, logFn, "  stopping tag gather — session still dead")
+					break
+				}
 			}
 			if len(batch) == 0 {
 				if recent, err := scrapeRecentPosts(client, *auth, q, 15); err == nil {
 					batch = append(batch, recent...)
+				} else if isCookieProblem(err) || isTransientNet(err) {
+					err = retryAfterCookie(client, auth, logFn, id, err, func() error {
+						var e2 error
+						recent, e2 = scrapeRecentPosts(client, *auth, q, 15)
+						if e2 == nil {
+							batch = append(batch, recent...)
+						}
+						return e2
+					})
+					if err != nil && isCookieProblem(err) {
+						accLog(id, logFn, "   tagged search error: %v", err)
+						accLog(id, logFn, "  stopping tag gather — session still dead")
+						break
+					}
 				}
 			}
 		}
 		sortScrapedByNotes(batch)
 		batch = filterPostsByNoteBand(batch, cfg.MinNotes, cfg.MaxNotes)
-		if len(batch) > perTag {
-			batch = batch[:perTag]
+		if len(batch) > want {
+			batch = batch[:want]
 		}
-		add(batch)
+		add(batch, q)
 	}
+	accLog(id, logFn, "  %d tagged posts", len(posts))
 	return posts
+}
+
+func normalizeFollowQuery(q string) string {
+	q = strings.TrimSpace(q)
+	q = strings.TrimPrefix(q, "#")
+	for _, prefix := range []string{
+		"https://www.tumblr.com/search/",
+		"http://www.tumblr.com/search/",
+		"https://tumblr.com/search/",
+		"http://tumblr.com/search/",
+		"https://www.tumblr.com/tagged/",
+		"http://www.tumblr.com/tagged/",
+		"https://tumblr.com/tagged/",
+		"http://tumblr.com/tagged/",
+	} {
+		q = strings.TrimPrefix(q, prefix)
+	}
+	if i := strings.IndexAny(q, "?#"); i >= 0 {
+		q = q[:i]
+	}
+	if dec, err := url.PathUnescape(q); err == nil {
+		q = dec
+	}
+	if dec, err := url.QueryUnescape(q); err == nil {
+		q = dec
+	}
+	return strings.TrimSpace(q)
 }
 
 func normalizeSeedBlogs(seeds []string) []string {
@@ -533,13 +909,20 @@ func normalizeSeedBlogs(seeds []string) []string {
 	var out []string
 	for _, s := range seeds {
 		s = strings.TrimSpace(s)
-		s = strings.TrimPrefix(s, "https://www.tumblr.com/")
-		s = strings.TrimPrefix(s, "http://www.tumblr.com/")
-		s = strings.TrimPrefix(s, "www.tumblr.com/")
+		for _, prefix := range []string{
+			"https://www.tumblr.com/",
+			"http://www.tumblr.com/",
+			"https://tumblr.com/",
+			"http://tumblr.com/",
+			"www.tumblr.com/",
+			"tumblr.com/",
+		} {
+			s = strings.TrimPrefix(s, prefix)
+		}
 		s = strings.Split(s, "/")[0]
 		s = strings.TrimSuffix(s, ".tumblr.com")
 		s = strings.TrimSpace(s)
-		if s == "" {
+		if s == "" || strings.EqualFold(s, "tagged") || strings.EqualFold(s, "search") {
 			continue
 		}
 		key := strings.ToLower(s)
@@ -660,6 +1043,10 @@ func gatherSearchPosts(client *http.Client, auth Auth, cfg FollowConfig) []Scrap
 		}
 	}
 	for _, q := range cfg.Queries {
+		q = normalizeFollowQuery(q)
+		if q == "" {
+			continue
+		}
 		fmt.Println("  search:", q)
 		batch, err := scrapeTopPosts(client, auth, q, 15)
 		if err != nil {
@@ -685,13 +1072,13 @@ func filterPostsByNoteBand(posts []ScrapedPost, minNotes, maxNotes int) []Scrape
 		return posts
 	}
 	var mid []ScrapedPost
-	var fallback []ScrapedPost
+	var underCap []ScrapedPost
 	for _, p := range posts {
-		fallback = append(fallback, p)
-		if minNotes > 0 && p.Notes < minNotes {
+		if maxNotes > 0 && p.Notes > maxNotes {
 			continue
 		}
-		if maxNotes > 0 && p.Notes > maxNotes {
+		underCap = append(underCap, p)
+		if minNotes > 0 && p.Notes < minNotes {
 			continue
 		}
 		mid = append(mid, p)
@@ -700,10 +1087,40 @@ func filterPostsByNoteBand(posts []ScrapedPost, minNotes, maxNotes int) []Scrape
 	if len(mid) > 0 {
 		return mid
 	}
-	return fallback
+	// When a maxNotes cap is set, never fall back to celebrity note dumps.
+	if maxNotes > 0 {
+		return underCap
+	}
+	return posts
+}
+
+// shardStringList gives each parallel reach worker its own slice of seeds/tags
+// so they don't all fetch the same notes lists.
+func shardStringList(items []string, shard, shards int) []string {
+	if shards <= 1 || len(items) == 0 {
+		return items
+	}
+	if shard < 0 {
+		shard = 0
+	}
+	shard = shard % shards
+	var out []string
+	for i, s := range items {
+		if i%shards == shard {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, items[shard%len(items)])
+	}
+	return out
 }
 
 func fetchBlogPosts(client *http.Client, auth *Auth, blog string, limit int) ([]ScrapedPost, error) {
+	return fetchBlogPostsAt(client, auth, blog, limit, 0)
+}
+
+func fetchBlogPostsAt(client *http.Client, auth *Auth, blog string, limit, offset int) ([]ScrapedPost, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("missing auth")
 	}
@@ -713,6 +1130,9 @@ func fetchBlogPosts(client *http.Client, auth *Auth, blog string, limit int) ([]
 	}
 	u := fmt.Sprintf("https://www.tumblr.com/api/v2/blog/%s/posts?limit=%d&npf=true",
 		url.PathEscape(blogID), limit)
+	if offset > 0 {
+		u += fmt.Sprintf("&offset=%d", offset)
+	}
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -972,6 +1392,25 @@ func isFollowRejected(err error) bool {
 }
 
 func followDelay(cfg FollowConfig) int {
+	// Timed bursts (messaging idle / between-chat): keep working until the deadline,
+	// don't burn the window on a full follow delay.
+	if !cfg.stopAfter.IsZero() {
+		left := int(time.Until(cfg.stopAfter).Seconds())
+		if left <= 3 {
+			return 0
+		}
+		burst := 6
+		if paceFast() {
+			burst = 3
+		}
+		if burst > left-2 {
+			burst = left - 2
+		}
+		if burst < 0 {
+			return 0
+		}
+		return burst
+	}
 	wait := cfg.DelaySeconds
 	if cfg.DelayJitterSeconds > 0 {
 		wait += rand.Intn(cfg.DelayJitterSeconds + 1)
@@ -1067,6 +1506,13 @@ func saveInteractedMap(m map[string]bool) {
 		return
 	}
 	_ = os.WriteFile(interactedFile, raw, 0644)
+}
+
+// interactedSnapshot loads the shared list once for checking many blogs.
+func interactedSnapshot() map[string]bool {
+	interactedMu.Lock()
+	defer interactedMu.Unlock()
+	return loadInteractedMap()
 }
 
 func hasInteracted(blog string) bool {

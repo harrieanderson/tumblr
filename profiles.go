@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,8 @@ const (
 	profilesDataDir          = "data/profiles"
 	ageVerifyAccountsFile    = "config/age-verify-accounts.json"
 	setupProfileAccountsFile = "config/setup-profile-accounts.json"
+	fixBioAccountsFile       = "config/fix-bio-accounts.json"
+	zoeyFullySetupFile       = "config/zoey-fully-setup.json"
 )
 
 type Account struct {
@@ -66,38 +69,201 @@ func isBadLogin(err error) bool {
 	return errors.As(err, &b)
 }
 
+// passwordChangeRequiredError is Tumblr's login banner "Please change your
+// password." The stored password cannot get a session until the user resets it.
+type passwordChangeRequiredError struct {
+	Email string
+	ID    string
+}
+
+func (e passwordChangeRequiredError) Error() string {
+	id := strings.TrimSpace(e.ID)
+	if id == "" {
+		id = accountSlug(e.Email)
+	}
+	if id == "" {
+		return "Tumblr requires a password change"
+	}
+	return "Tumblr requires a password change for " + id
+}
+
+func isPasswordChangeRequired(err error) bool {
+	var p passwordChangeRequiredError
+	return errors.As(err, &p)
+}
+
+const badLoginsFile = "config/bad-logins.json"
+const discardedAccountsFile = "config/discarded-accounts.json"
+
+// explicitLogin is set for -login runs, which may retry a rejected account.
+var explicitLogin bool
+
+func loadBadLogins() map[string]string {
+	seen := map[string]string{}
+	if raw, err := os.ReadFile(badLoginsFile); err == nil {
+		_ = json.Unmarshal(raw, &seen)
+	}
+	return seen
+}
+
+// recentBadLogin stops automatic re-logins from hammering an account Tumblr
+// just rejected; repeated failures are what gets an account locked.
+func recentBadLogin(id string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, loadBadLogins()[id])
+	if err != nil || time.Since(t) > 24*time.Hour {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func clearBadLogin(id string) {
+	seen := loadBadLogins()
+	if _, ok := seen[id]; !ok {
+		return
+	}
+	delete(seen, id)
+	if out, err := json.MarshalIndent(seen, "", "  "); err == nil {
+		_ = os.WriteFile(badLoginsFile, append(out, '\n'), 0o644)
+	}
+}
+
+// discardDeadLogin only records the rejection. Tumblr shows "incorrect
+// password" for suspicious logins too (new IP, hidden Chrome), so deleting the
+// account's credentials and data on that signal destroyed working accounts.
 func discardDeadLogin(email string) error {
 	email = strings.TrimSpace(email)
 	if email == "" {
 		return nil
 	}
 	id := accountSlug(email)
-	fmt.Println("Discarding", email, "— password was wrong. Removed from the project.")
+	fmt.Println("Tumblr rejected the login for", email, "— keeping the account. Check it with: tumblr.exe -login -account", id)
 
-	raw, err := os.ReadFile(credentialsFile)
+	seen := loadBadLogins()
+	seen[id] = time.Now().Format(time.RFC3339)
+	out, err := json.MarshalIndent(seen, "", "  ")
 	if err != nil {
 		return err
+	}
+	return os.WriteFile(badLoginsFile, append(out, '\n'), 0o644)
+}
+
+type discardedAccount struct {
+	Email  string `json:"email,omitempty"`
+	Reason string `json:"reason"`
+	At     string `json:"at"`
+}
+
+func loadDiscardedAccounts() map[string]discardedAccount {
+	out := map[string]discardedAccount{}
+	raw, err := os.ReadFile(discardedAccountsFile)
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
+func recordDiscardedAccount(id, email, reason string) error {
+	id = accountSlug(id)
+	if id == "" {
+		id = accountSlug(email)
+	}
+	if id == "" {
+		return nil
+	}
+	seen := loadDiscardedAccounts()
+	seen[id] = discardedAccount{
+		Email:  strings.TrimSpace(email),
+		Reason: strings.TrimSpace(reason),
+		At:     time.Now().Format(time.RFC3339),
+	}
+	raw, err := json.MarshalIndent(seen, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(discardedAccountsFile, append(raw, '\n'), 0o644)
+}
+
+// discardPasswordChangeLogin removes the email from credentials.json — Tumblr
+// will not issue a session until the password is reset in a browser.
+func discardPasswordChangeLogin(email string) error {
+	email = strings.TrimSpace(email)
+	id := accountSlug(email)
+	if id == "" {
+		if acc, ok := currentAccount(); ok {
+			email = acc.Email
+			id = acc.ID
+		}
+	}
+	if id == "" {
+		return nil
+	}
+	removed, err := removeCredentialByID(id)
+	if err != nil {
+		fmt.Println("Could not remove", id, "from credentials:", err)
+	} else if removed != "" {
+		fmt.Println("Discarded", id, "— Tumblr requires a password change. Removed from credentials.json.")
+		email = removed
+	} else {
+		fmt.Println("Discarded", id, "— Tumblr requires a password change.")
+	}
+	clearAuthSessionFile(id)
+	return recordDiscardedAccount(id, email, "password_change_required")
+}
+
+func clearAuthSessionFile(id string) {
+	id = accountSlug(id)
+	if id == "" {
+		return
+	}
+	path := filepath.Join(profilesAuthDir, id, "auth.json")
+	auth, err := loadAuthFrom(path)
+	if err != nil {
+		return
+	}
+	clearAuthSession(&auth)
+	_ = saveAuth(auth)
+}
+
+// removeCredentialByID deletes the email→password entry for this account id.
+// Returns the removed email (empty if not found).
+func removeCredentialByID(id string) (string, error) {
+	id = accountSlug(id)
+	if id == "" {
+		return "", nil
+	}
+	raw, err := os.ReadFile(credentialsFile)
+	if err != nil {
+		return "", err
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
-		return err
+		return "", err
 	}
-	for k := range obj {
-		if strings.EqualFold(strings.TrimSpace(k), email) {
-			delete(obj, k)
+	var removed string
+	for key, val := range obj {
+		if isReservedCredKey(key) {
+			continue
 		}
+		var pass string
+		if json.Unmarshal(val, &pass) != nil {
+			continue
+		}
+		if accountSlug(key) != id {
+			continue
+		}
+		removed = strings.TrimSpace(key)
+		delete(obj, key)
+		break
+	}
+	if removed == "" {
+		return "", nil
 	}
 	out, err := json.MarshalIndent(obj, "", "  ")
 	if err != nil {
-		return err
+		return removed, err
 	}
-	if err := os.WriteFile(credentialsFile, append(out, '\n'), 0600); err != nil {
-		return err
-	}
-	_ = os.RemoveAll(filepath.Join(profilesAuthDir, id))
-	_ = os.RemoveAll(filepath.Join(chromeProfilesDir(), id))
-	_ = os.RemoveAll(filepath.Join(profilesDataDir, id))
-	return nil
+	return removed, os.WriteFile(credentialsFile, append(out, '\n'), 0o600)
 }
 
 func (a Account) isEnabled() bool {
@@ -240,9 +406,13 @@ func enabledAccounts() []Account {
 	}
 	var out []Account
 	for _, a := range accountsFromCreds(c) {
-		if a.isEnabled() {
-			out = append(out, a)
+		if !a.isEnabled() {
+			continue
 		}
+		if accountIsTerminated(a.ID) {
+			continue
+		}
+		out = append(out, a)
 	}
 	return out
 }
@@ -403,6 +573,109 @@ func messagedPath() string {
 	return accountDataFile("messaged.json")
 }
 
+func dmReplySetsPath() string {
+	return accountDataFile("dm-reply-sets.json")
+}
+
+func dmReplySetsPathFor(accountID string) string {
+	accountID = accountSlug(accountID)
+	if accountID != "" && usingIsolatedProfiles() {
+		return filepath.Join(profilesDataDir, accountID, "dm-reply-sets.json")
+	}
+	return dmReplySetsPath()
+}
+
+func loadDMReplySets() map[string]int {
+	return loadDMReplySetsFor("")
+}
+
+func loadDMReplySetsFor(accountID string) map[string]int {
+	out := map[string]int{}
+	raw, err := os.ReadFile(dmReplySetsPathFor(accountID))
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(raw, &out)
+	if out == nil {
+		out = map[string]int{}
+	}
+	return out
+}
+
+func saveDMReplySets(m map[string]int) {
+	saveDMReplySetsFor("", m)
+}
+
+func saveDMReplySetsFor(accountID string, m map[string]int) {
+	path := dmReplySetsPathFor(accountID)
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	raw, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, raw, 0644)
+}
+
+func dmReplySetsFor(otherName string) int {
+	return dmReplySetsForAccount("", otherName)
+}
+
+func dmReplySetsForAccount(accountID, otherName string) int {
+	key := strings.ToLower(strings.TrimSpace(otherName))
+	if key == "" {
+		return 0
+	}
+	return loadDMReplySetsFor(accountID)[key]
+}
+
+func syncDMReplySetsAtLeast(otherName string, atLeast int) {
+	syncDMReplySetsAtLeastFor("", otherName, atLeast)
+}
+
+func syncDMReplySetsAtLeastFor(accountID, otherName string, atLeast int) {
+	key := strings.ToLower(strings.TrimSpace(otherName))
+	if key == "" || atLeast <= 0 {
+		return
+	}
+	m := loadDMReplySetsFor(accountID)
+	if m[key] >= atLeast {
+		return
+	}
+	m[key] = atLeast
+	saveDMReplySetsFor(accountID, m)
+}
+
+func clearDMReplySet(otherName string) {
+	clearDMReplySetFor("", otherName)
+}
+
+func clearDMReplySetFor(accountID, otherName string) {
+	key := strings.ToLower(strings.TrimSpace(otherName))
+	if key == "" {
+		return
+	}
+	m := loadDMReplySetsFor(accountID)
+	if _, ok := m[key]; !ok {
+		return
+	}
+	delete(m, key)
+	saveDMReplySetsFor(accountID, m)
+}
+
+func noteDMReplySet(otherName string) {
+	noteDMReplySetFor("", otherName)
+}
+
+func noteDMReplySetFor(accountID, otherName string) {
+	key := strings.ToLower(strings.TrimSpace(otherName))
+	if key == "" {
+		return
+	}
+	m := loadDMReplySetsFor(accountID)
+	m[key]++
+	saveDMReplySetsFor(accountID, m)
+}
+
 func currentDebugPort() string {
 	acc, ok := currentAccount()
 	if !ok {
@@ -497,7 +770,7 @@ func initAccounts() error {
 		}
 	}
 	if want != "" {
-		if _, ok := findAccount(want); ok {
+		if a, ok := findAccount(want); ok && a.isEnabled() && !accountIsTerminated(a.ID) {
 			return setActiveAccount(want)
 		}
 	}
@@ -538,29 +811,52 @@ type accountPublic struct {
 }
 
 func publicAccounts() []accountPublic {
+	accs, _ := publicAccountsWithTally()
+	return accs
+}
+
+func publicAccountsWithTally() ([]accountPublic, followerTally) {
+	now := time.Now().Local()
+	tally := followerTally{Date: now.Format("2006-01-02")}
 	cur, _ := currentAccount()
 	var out []accountPublic
 	for _, a := range allAccounts() {
 		auth := peekAccountAuth(a.ID)
-		blog := strings.TrimSpace(auth.Blog)
-		if strings.EqualFold(blog, "YOUR_BLOG_NAME") {
-			blog = ""
+		log := loadFollowerLog(a.ID)
+		blog, followers := bestAccountBlogStats(a.ID, log)
+		if !usableBlogName(blog) {
+			blog = strings.TrimSpace(auth.Blog)
+			if strings.HasPrefix(blog, "t:") || strings.EqualFold(blog, "YOUR_BLOG_NAME") {
+				blog = ""
+			}
 		}
-		snap := loadFollowerLog(a.ID).Latest
-		if snap.Primary != "" && (blog == "" || strings.HasPrefix(blog, "t:")) {
-			blog = snap.Primary
-		}
+		enabled := a.isEnabled()
 		out = append(out, accountPublic{
 			ID:        a.ID,
 			Email:     a.Email,
-			Enabled:   a.isEnabled(),
+			Enabled:   enabled,
 			Blog:      blog,
-			Followers: snap.Followers,
+			Followers: followers,
 			LoggedIn:  authHasSID(auth),
 			Active:    a.ID == cur.ID,
 		})
+		if enabled && (log.Latest.At != "" || followers > 0) {
+			tally.Total += followers
+			tally.Accounts++
+			tally.TodayNew += accountDailyNewFollowers(log, now)
+		}
 	}
-	return out
+	sortAccountsByFollowers(out)
+	return out, tally
+}
+
+func sortAccountsByFollowers(accs []accountPublic) {
+	sort.SliceStable(accs, func(i, j int) bool {
+		if accs[i].Followers != accs[j].Followers {
+			return accs[i].Followers > accs[j].Followers
+		}
+		return strings.ToLower(accs[i].ID) < strings.ToLower(accs[j].ID)
+	})
 }
 
 func loginAllAccounts() error {
@@ -572,51 +868,68 @@ func loginAllAccounts() error {
 		}
 		return loginWithRealChrome(&auth)
 	}
+	start, err := accountStartIndex(accs, accountStartFrom)
+	if err != nil {
+		return err
+	}
+	if start > 0 {
+		fmt.Printf("Starting at account %d/%d (%s)\n", start+1, len(accs), accs[start].ID)
+	}
 	seen := map[string]string{}
 	var first error
-	for i, a := range accs {
+	for i := start; i < len(accs); i++ {
+		a := accs[i]
 		fmt.Printf("\n=== Login %d/%d: %s (%s) ===\n", i+1, len(accs), a.ID, a.Email)
+		var stopChromeFn func()
 		if err := setActiveAccount(a.ID); err != nil {
 			fmt.Println("Skip:", err)
 			if first == nil {
 				first = err
 			}
-			continue
-		}
-		auth, err := loadAuth()
-		if err != nil {
-			auth = Auth{}
-		}
-		if err := loginWithRealChrome(&auth); err != nil {
-			if isBadLogin(err) {
-				fmt.Println("Skipping this account.")
-				continue
+		} else {
+			auth, err := loadAuth()
+			if err != nil {
+				auth = Auth{}
 			}
-			fmt.Println("Login failed:", err)
-			if first == nil {
-				first = err
+			stopChromeFn, err = loginWithRealChromeKeepOpen(&auth)
+			if err != nil {
+				stopChromeFn = nil
+				if isBadLogin(err) {
+					fmt.Println("Skipping this account.")
+				} else {
+					fmt.Println("Login failed:", err)
+					if first == nil {
+						first = err
+					}
+				}
+			} else {
+				auth, _ = loadAuth()
+				id := strings.ToLower(strings.TrimSpace(auth.Blog))
+				name := id
+				if client := newHumanClient(); authHasSID(auth) {
+					if n, err := syncAuthIdentity(client, &auth); err == nil && n != "" {
+						name = n
+						id = strings.ToLower(n)
+					}
+				}
+				if prev, ok := seen[id]; ok && id != "" {
+					fmt.Printf("COLLISION: %s logged in as @%s — same Tumblr as %s. Cookies were not isolated.\n", a.ID, name, prev)
+					if first == nil {
+						first = fmt.Errorf("%s shares Tumblr @%s with %s", a.ID, name, prev)
+					}
+				} else if id != "" {
+					seen[id] = a.ID
+					fmt.Println("Isolated session:", a.ID, "→ @"+name)
+				}
 			}
-			continue
 		}
-		auth, _ = loadAuth()
-		id := strings.ToLower(strings.TrimSpace(auth.Blog))
-		name := id
-		if client := newHumanClient(); authHasSID(auth) {
-			if n, err := syncAuthIdentity(client, &auth); err == nil && n != "" {
-				name = n
-				id = strings.ToLower(n)
-			}
+		if i+1 < len(accs) {
+			waitForEnterNextAccount(accs[i+1].ID, i+2, len(accs))
+		} else {
+			waitForEnterNextAccount("", i+2, len(accs))
 		}
-		if prev, ok := seen[id]; ok && id != "" {
-			fmt.Printf("COLLISION: %s logged in as @%s — same Tumblr as %s. Cookies were not isolated.\n", a.ID, name, prev)
-			if first == nil {
-				first = fmt.Errorf("%s shares Tumblr @%s with %s", a.ID, name, prev)
-			}
-			continue
-		}
-		if id != "" {
-			seen[id] = a.ID
-			fmt.Println("Isolated session:", a.ID, "→ @"+name)
+		if stopChromeFn != nil {
+			stopChromeFn()
 		}
 	}
 	fmt.Printf("\nIsolated Tumblr sessions: %d / %d\n", len(seen), len(accs))
@@ -627,6 +940,10 @@ func loggedInUniqueAccounts(limit int) []Account {
 	var out []Account
 	seen := map[string]string{}
 	for _, a := range enabledAccounts() {
+		if accountIsTerminated(a.ID) {
+			fmt.Println("Skip", a.ID, "— Tumblr terminated this account")
+			continue
+		}
 		auth := peekAccountAuth(a.ID)
 		if !authHasSID(auth) {
 			fmt.Println("Skip", a.ID, "— not logged in")
@@ -646,6 +963,290 @@ func loggedInUniqueAccounts(limit int) []Account {
 		}
 	}
 	return out
+}
+
+// loggedInTopFollowerAccounts returns up to limit logged-in enabled accounts,
+// highest follower count first, deduped by Tumblr blog.
+func loggedInTopFollowerAccounts(limit int) []Account {
+	pubs, _ := publicAccountsWithTally() // already sorted by followers desc
+	byID := map[string]Account{}
+	for _, a := range enabledAccounts() {
+		byID[a.ID] = a
+	}
+	var out []Account
+	seenBlog := map[string]string{}
+	for _, p := range pubs {
+		if !p.Enabled || !p.LoggedIn {
+			continue
+		}
+		if accountIsTerminated(p.ID) {
+			continue
+		}
+		a, ok := byID[p.ID]
+		if !ok {
+			continue
+		}
+		blog := strings.ToLower(strings.TrimSpace(p.Blog))
+		if blog == "" {
+			auth := peekAccountAuth(p.ID)
+			blog = strings.ToLower(strings.TrimSpace(auth.Blog))
+		}
+		if blog != "" {
+			if prev, ok := seenBlog[blog]; ok {
+				fmt.Println("Skip", p.ID, "— same Tumblr as", prev)
+				continue
+			}
+			seenBlog[blog] = p.ID
+		}
+		out = append(out, a)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// loadFullySetupAccountIDs reads config/zoey-fully-setup.json (today's completed looks).
+func loadFullySetupAccountIDs() ([]string, error) {
+	raw, err := os.ReadFile(zoeyFullySetupFile)
+	if err != nil {
+		return nil, err
+	}
+	var wrap struct {
+		Accounts []struct {
+			ID string `json:"id"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &wrap); err != nil {
+		return nil, err
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, a := range wrap.Accounts {
+		id := strings.TrimSpace(a.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// loggedInFullySetupAccounts returns logged-in enabled accounts from the fully-setup list.
+func loggedInFullySetupAccounts() []Account {
+	ids, err := loadFullySetupAccountIDs()
+	if err != nil {
+		fmt.Println("fully-setup list:", err)
+		return nil
+	}
+	byID := map[string]Account{}
+	for _, a := range enabledAccounts() {
+		byID[a.ID] = a
+	}
+	var out []Account
+	seenBlog := map[string]string{}
+	for _, id := range ids {
+		a, ok := byID[id]
+		if !ok {
+			fmt.Println("Skip", id, "— not in credentials / disabled")
+			continue
+		}
+		if accountIsTerminated(id) {
+			fmt.Println("Skip", id, "— Tumblr terminated this account")
+			continue
+		}
+		auth := peekAccountAuth(id)
+		if !authHasSID(auth) {
+			fmt.Println("Skip", id, "— not logged in")
+			continue
+		}
+		blog := strings.ToLower(strings.TrimSpace(auth.Blog))
+		if blog != "" {
+			if prev, ok := seenBlog[blog]; ok {
+				fmt.Println("Skip", id, "— same Tumblr as", prev)
+				continue
+			}
+			seenBlog[blog] = id
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+const reachRotateFile = "data/reach-rotate.json"
+
+var reachPoolSize = 80 // top 20 by followers + next 60; -follow -top-followers N narrows it
+
+var (
+	reachPoolMu      sync.Mutex
+	reachPoolCache   []Account
+	reachLikerShards int
+	reachShardPool   []Account
+)
+
+func likerShardPool() []Account {
+	if len(reachShardPool) > 0 {
+		return reachShardPool
+	}
+	if reachLikerShards > 1 {
+		return reachAccountPool()
+	}
+	return nil
+}
+
+func resetReachPool() {
+	reachPoolMu.Lock()
+	reachPoolCache = nil
+	reachPoolMu.Unlock()
+}
+
+// loggedInReachCandidates is the overnight reach pool: highest-follower
+// logged-in blogs first (top 20 + next 60 when limit is 80).
+func loggedInReachCandidates(limit int) []Account {
+	return loggedInTopFollowerAccounts(limit)
+}
+
+func reachAccountPool() []Account {
+	reachPoolMu.Lock()
+	defer reachPoolMu.Unlock()
+	if len(reachPoolCache) > 0 {
+		return reachPoolCache
+	}
+	// Top followers only, but every account in it gets the same turns — the
+	// growth tiers are not used to skip anyone.
+	for _, a := range loggedInReachCandidates(0) {
+		if _, bad := recentBadLogin(a.ID); bad {
+			continue
+		}
+		reachPoolCache = append(reachPoolCache, a)
+		if len(reachPoolCache) >= reachPoolSize {
+			break
+		}
+	}
+	fmt.Printf("Reach pool: top %d logged-in accounts by followers, least recently reached go first\n", len(reachPoolCache))
+	return reachPoolCache
+}
+
+const (
+	reachLastFile      = "data/reach-last.json"
+	minReachBatchSlice = 15 * time.Minute
+)
+
+// reachWindow is the whole -for window of a reach run, split evenly across
+// the batches so every account in the pool gets a turn before it ends.
+var reachWindow time.Duration
+
+func reachBatchSlice(window time.Duration, pool, perBatch int) time.Duration {
+	if window <= 0 || pool <= 0 || perBatch <= 0 {
+		return 0
+	}
+	batches := (pool + perBatch - 1) / perBatch
+	slice := window / time.Duration(batches)
+	if slice < minReachBatchSlice {
+		slice = minReachBatchSlice
+	}
+	return slice
+}
+
+func loadReachLast() map[string]time.Time {
+	m := map[string]time.Time{}
+	if raw, err := os.ReadFile(reachLastFile); err == nil {
+		_ = json.Unmarshal(raw, &m)
+	}
+	return m
+}
+
+func markReached(accs []Account) {
+	m := loadReachLast()
+	now := time.Now()
+	// Staggered by position so the next pass keeps the round-robin order
+	// instead of falling back to alphabetical ties.
+	for i, a := range accs {
+		m[a.ID] = now.Add(time.Duration(i) * time.Millisecond)
+	}
+	if raw, err := json.MarshalIndent(m, "", "  "); err == nil {
+		_ = os.MkdirAll(filepath.Dir(reachLastFile), 0o755)
+		_ = os.WriteFile(reachLastFile, append(raw, '\n'), 0o644)
+	}
+}
+
+// leastRecentlyReached orders accounts by when reach last ran on them; never
+// reached first, ties broken by id so the order is stable.
+func leastRecentlyReached(pool []Account, last map[string]time.Time) []Account {
+	out := append([]Account(nil), pool...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, tj := last[out[i].ID], last[out[j].ID]
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func loadReachRotateOffset(mod int) int {
+	if mod <= 0 {
+		return 0
+	}
+	raw, err := os.ReadFile(reachRotateFile)
+	if err != nil {
+		return 0
+	}
+	var wrap struct {
+		Offset int `json:"offset"`
+	}
+	if json.Unmarshal(raw, &wrap) != nil {
+		return 0
+	}
+	off := wrap.Offset % mod
+	if off < 0 {
+		off += mod
+	}
+	return off
+}
+
+func saveReachRotateOffset(off int) {
+	_ = os.MkdirAll(filepath.Dir(reachRotateFile), 0755)
+	raw, err := json.MarshalIndent(map[string]int{"offset": off}, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(reachRotateFile, raw, 0644)
+}
+
+func rotateAccountSlice(accs []Account, off int) []Account {
+	n := len(accs)
+	if n == 0 {
+		return accs
+	}
+	off %= n
+	if off < 0 {
+		off += n
+	}
+	if off == 0 {
+		out := make([]Account, n)
+		copy(out, accs)
+		return out
+	}
+	out := make([]Account, 0, n)
+	out = append(out, accs[off:]...)
+	out = append(out, accs[:off]...)
+	return out
+}
+
+func rotateLoggedInForReach(n int) []Account {
+	resetReachPool()
+	pool := reachAccountPool()
+	if len(pool) == 0 {
+		return nil
+	}
+	if n <= 0 || n > len(pool) {
+		n = len(pool)
+	}
+	picked := leastRecentlyReached(pool, loadReachLast())[:n]
+	markReached(picked)
+	return picked
 }
 
 func runForAccountsParallel(label string, accs []Account, fn func(Account) error) error {
@@ -671,13 +1272,61 @@ func runForAccountsParallel(label string, accs []Account, fn func(Account) error
 			}
 		}(i)
 		if i+1 < len(accs) {
-			gap := 12 + i*6
+			gap := 4
 			if paceFast() {
-				gap = 2 + i
+				gap = 1
 			}
 			time.Sleep(time.Duration(gap) * time.Second)
 		}
 	}
+	wg.Wait()
+	return first
+}
+
+func runForAccountsParallelLimited(label string, accs []Account, limit int, fn func(Account) error) error {
+	gap := 4
+	if paceFast() {
+		gap = 1
+	}
+	return runForAccountsParallelLimitedStagger(label, accs, limit, gap, fn)
+}
+
+func runForAccountsParallelLimitedStagger(label string, accs []Account, limit, staggerSec int, fn func(Account) error) error {
+	if limit <= 0 || limit >= len(accs) {
+		return runForAccountsParallel(label, accs, fn)
+	}
+	type job struct {
+		i int
+		a Account
+	}
+	jobs := make(chan job)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var first error
+	for w := 0; w < limit; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				fmt.Printf("\n======== %s: %s (%d/%d) parallel ========\n", label, j.a.ID, j.i+1, len(accs))
+				if err := fn(j.a); err != nil {
+					fmt.Printf("[%s] Error: %v\n", j.a.ID, err)
+					errMu.Lock()
+					if first == nil {
+						first = err
+					}
+					errMu.Unlock()
+				}
+			}
+		}()
+	}
+	for i, a := range accs {
+		jobs <- job{i: i, a: a}
+		if staggerSec > 0 && i+1 < len(accs) {
+			time.Sleep(time.Duration(staggerSec) * time.Second)
+		}
+	}
+	close(jobs)
 	wg.Wait()
 	return first
 }
@@ -732,7 +1381,7 @@ func runForEachAccountList(label string, accs []Account, fn func() error) error 
 			continue
 		}
 		if err := fn(); err != nil {
-			if isBadLogin(err) {
+			if isBadLogin(err) || isTerminated(err) {
 				fmt.Println("Skipping this account.")
 				continue
 			}
@@ -787,6 +1436,10 @@ func accountIDsFromFile(path, label string) []Account {
 			fmt.Println("Skip unknown account:", id)
 			continue
 		}
+		if accountIsTerminated(a.ID) {
+			fmt.Println("Skip", a.ID, "— Tumblr closed this account")
+			continue
+		}
 		seen[id] = true
 		out = append(out, a)
 	}
@@ -805,20 +1458,17 @@ func currentTumblrIdentity() (string, error) {
 	if !authHasSID(auth) {
 		return "", fmt.Errorf("no saved cookies")
 	}
-	client := &http.Client{Timeout: 45 * time.Second}
+	client := newAuthClient(&auth)
 	if err := refreshCSRF(client, &auth); err != nil {
 		if err := ensureSession(client, &auth); err != nil {
 			return "", err
 		}
 	}
-	_, primary, err := listAccountBlogs(client, auth)
+	name, err := verifyAccountBlog(client, &auth)
 	if err != nil {
-		if blogConfigured(auth.Blog) {
-			return strings.ToLower(auth.Blog), nil
-		}
 		return "", err
 	}
-	return strings.ToLower(strings.TrimSpace(primary)), nil
+	return strings.ToLower(strings.TrimSpace(name)), nil
 }
 
 func runForEachUniqueBlog(label string, fn func() error) error {
@@ -852,5 +1502,35 @@ func applyAccountFlag(id string) error {
 		return setActiveAccount(accs[0].ID)
 	}
 	runAllAccounts = false
+	if accs := accountsFromCommaFlag(id); len(accs) > 0 {
+		return setActiveAccount(accs[0].ID)
+	}
 	return setActiveAccount(id)
+}
+
+func accountsFromCommaFlag(flag string) []Account {
+	flag = strings.TrimSpace(flag)
+	if flag == "" || !strings.Contains(flag, ",") {
+		return nil
+	}
+	var out []Account
+	seen := map[string]bool{}
+	for _, part := range strings.Split(flag, ",") {
+		id := accountSlug(part)
+		if id == "" || seen[id] {
+			continue
+		}
+		a, ok := findAccount(id)
+		if !ok || !a.isEnabled() {
+			fmt.Println("Skip unknown account:", id)
+			continue
+		}
+		if accountIsTerminated(a.ID) {
+			fmt.Println("Skip", a.ID, "— Tumblr closed this account")
+			continue
+		}
+		seen[id] = true
+		out = append(out, a)
+	}
+	return out
 }

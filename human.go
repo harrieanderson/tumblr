@@ -17,15 +17,17 @@ const (
 )
 
 func newHumanClient() *http.Client {
+	return newHumanClientFor("")
+}
+
+// newHumanClientFor builds an HTTP client paced through the shared proxy pool
+// when config/proxies.json is enabled. accountID sticky-binds the exit IP.
+// TLS uses uTLS Chrome (HelloChrome_Auto) + HTTP/2 for a browser-like fingerprint.
+func newHumanClientFor(accountID string) *http.Client {
+	base := newChromeTransport(accountID)
 	return &http.Client{
-		Timeout: 45 * time.Second,
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			MaxIdleConns:          20,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   15 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+		Timeout:   45 * time.Second,
+		Transport: wrapProxyPace(base, accountID),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 8 {
 				return fmt.Errorf("too many redirects")
@@ -84,16 +86,19 @@ func persistMaturePref(auth *Auth) {
 }
 
 // warmSession mimics opening Tumblr: dashboard loads, short scrolls, no follows.
-func warmSession(client *http.Client, auth *Auth) {
-	fmt.Println("Warming up session (human open-app ritual)…")
+func warmSession(client *http.Client, auth *Auth, id string, logFn func(string)) {
+	if strings.TrimSpace(id) == "" && auth != nil {
+		id = accountIDFromAuth(*auth)
+	}
+	accLog(id, logFn, "Warming up (dashboard only — likes start after this)")
 	persistMaturePref(auth)
 	_ = ensureSession(client, auth)
 	if name, err := syncAuthIdentity(client, auth); err == nil && name != "" {
-		fmt.Println("  signed in as:", name)
+		accLog(id, logFn, "  signed in as: %s", name)
 		rememberManagedBlog(accountIDFromAuth(*auth), name)
 	}
 	rememberBlogsFromAuth(client, auth)
-	logOwnFollowers(client, auth, nil)
+	logOwnFollowers(client, auth, logFn)
 	_ = browseDashboard(client, *auth)
 	humanPause(4, 12)
 	_ = browseDashboard(client, *auth)
@@ -101,7 +106,7 @@ func warmSession(client *http.Client, auth *Auth) {
 		humanPause(6, 18)
 		_ = browseDashboard(client, *auth)
 	}
-	fmt.Println("Warm-up done — starting slow session.")
+	accLog(id, logFn, "Warm-up done — collecting posts and liking likers")
 	humanPause(5, 14)
 }
 

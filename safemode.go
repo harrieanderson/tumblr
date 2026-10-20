@@ -98,3 +98,36 @@ func waitForEnterPrompt(msg string) {
 		time.Sleep(500 * time.Millisecond)
 	}
 }
+
+func waitForEnterNextAccount(nextID string, next, total int) {
+	fmt.Println()
+	fmt.Println("Chrome stays open. Look around in that window.")
+	if next > total || strings.TrimSpace(nextID) == "" {
+		fmt.Println("Press Enter in THIS console when you are done.")
+	} else {
+		fmt.Printf("Press Enter in THIS console for the next account (%d/%d: %s)…\n", next, total, nextID)
+	}
+	if !stdinIsConsole() {
+		fmt.Println("No keyboard attached — waiting for you to close Chrome.")
+		for {
+			if liveDebugPort == "" || !portInUse(liveDebugPort) {
+				fmt.Println("Chrome closed.")
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	ignoreUntil := time.Now().Add(1500 * time.Millisecond)
+	r := bufio.NewReader(os.Stdin)
+	for {
+		_, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if time.Now().Before(ignoreUntil) {
+			fmt.Println("Ignored leftover Enter — press Enter again when you want the next account.")
+			continue
+		}
+		return
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"html"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -18,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const (
@@ -26,27 +29,298 @@ const (
 )
 
 func createPhotoPost(client *http.Client, auth Auth, imagePath, caption string) error {
-	return createPhotoPostOn(client, auth, auth.Blog, imagePath, caption)
+	return createPhotoPostPinned(client, auth, imagePath, caption, false)
+}
+
+func createPhotoPostPinned(client *http.Client, auth Auth, imagePath, caption string, pin bool) error {
+	return createPhotoPostOnPinned(client, auth, auth.Blog, imagePath, caption, pin)
 }
 
 func createPhotoPostOn(client *http.Client, auth Auth, blogID, imagePath, caption string) error {
+	return createPhotoPostOnPinned(client, auth, blogID, imagePath, caption, false)
+}
+
+func createPhotoPostOnPinned(client *http.Client, auth Auth, blogID, imagePath, caption string, pin bool) error {
 	auth.Blog = blogID
-	var body []byte
-	var status string
-	var err error
-	if isVideoPath(imagePath) {
-		body, status, err = createVideoPostLegacy(client, auth, imagePath, caption, "published")
-	} else {
-		body, status, err = createPhotoPostState(client, auth, imagePath, caption, "published")
+	name, err := verifyAccountBlog(client, &auth)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Verified photo post target: @%s (account %s)\n", name, accountIDFromAuth(auth))
+	body, status, err := createPhotoPostState(client, auth, imagePath, caption, "published")
+	// NPF rejects link formatting on mathematical-script glyphs (fancy Clicky).
+	// Legacy /post with HTML caption keeps the look + working beacons link.
+	if err != nil && isVideoPath(imagePath) {
+		fmt.Println("NPF video rejected — retrying legacy video upload…")
+		body, status, err = createVideoPostLegacy(client, auth, imagePath, captionToLegacyHTML(caption), "published")
+	} else if err != nil && !isVideoPath(imagePath) {
+		fmt.Println("NPF photo rejected — retrying legacy photo upload (HTML Clicky link)…")
+		body, status, err = createPhotoPostLegacy(client, auth, imagePath, captionToLegacyHTML(caption), "published")
 	}
 	fmt.Println("Status:", status)
 	if err != nil {
 		fmt.Println(truncate(string(body), 200))
+		return err
 	}
-	return err
+	id := parseCreatedPostID(body)
+	kind := "photo"
+	if isVideoPath(imagePath) {
+		kind = "video"
+	}
+	record := func(pinned bool) {
+		recordPost(ledgerEntry{
+			Account: accountIDFromAuth(auth),
+			Blog:    name,
+			Kind:    kind,
+			Text:    caption,
+			Media:   filepath.Base(imagePath),
+			PostID:  id,
+			Pinned:  pinned,
+		})
+	}
+	if !pin {
+		record(false)
+		return nil
+	}
+	if id == "" {
+		record(false)
+		return fmt.Errorf("posted, but Tumblr did not return an id to pin")
+	}
+	// Videos need a moment before Tumblr accepts pin (same API the GUI uses).
+	if isVideoPath(imagePath) {
+		time.Sleep(3 * time.Second)
+	}
+	if err := pinBlogPost(client, &auth, id); err != nil {
+		record(false)
+		return fmt.Errorf("posted, but pin failed: %w", err)
+	}
+	record(true)
+	fmt.Println("Pinned post", id)
+	return nil
+}
+
+func parseCreatedPostID(body []byte) string {
+	var wrap struct {
+		Response struct {
+			ID       json.RawMessage `json:"id"`
+			IDString string          `json:"id_string"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(body, &wrap) != nil {
+		return ""
+	}
+	if s := strings.TrimSpace(wrap.Response.IDString); s != "" {
+		return s
+	}
+	raw := strings.TrimSpace(string(wrap.Response.ID))
+	raw = strings.Trim(raw, `"`)
+	if raw == "" || raw == "null" {
+		return ""
+	}
+	return raw
+}
+
+// pinBlogPost uses the same pin endpoints as the GUI photo-pin checkbox.
+func pinBlogPost(client *http.Client, auth *Auth, postID string) error {
+	if auth == nil {
+		return fmt.Errorf("missing auth")
+	}
+	postID = strings.TrimSpace(postID)
+	blog := strings.TrimSpace(auth.Blog)
+	if postID == "" || blog == "" {
+		return fmt.Errorf("missing blog or post id")
+	}
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*2) * time.Second)
+		}
+		if err := pinBlogPostOnce(client, auth, blog, postID); err == nil {
+			return nil
+		} else {
+			last = err
+		}
+	}
+	if last == nil {
+		return fmt.Errorf("pin failed")
+	}
+	return last
+}
+
+func pinBlogPostOnce(client *http.Client, auth *Auth, blog, postID string) error {
+	tries := []struct {
+		method, path string
+		body         map[string]any
+	}{
+		{"PUT", "/posts/" + postID, map[string]any{"pin": true}},
+		{"PUT", "/posts/" + postID, map[string]any{"is_pinned": true}},
+		{"POST", "/posts/" + postID + "/pin", map[string]any{"pin": true}},
+	}
+	var last error
+	for _, t := range tries {
+		raw, err := json.Marshal(t.body)
+		if err != nil {
+			return err
+		}
+		u := "https://www.tumblr.com/api/v2/blog/" + blog + t.path
+		req, err := http.NewRequest(t.method, u, bytes.NewReader(raw))
+		if err != nil {
+			return err
+		}
+		setCommonHeaders(req, *auth)
+		req.Header.Set("Content-Type", "application/json; charset=utf8")
+		req.Header.Set("X-CSRF", auth.CSRF)
+		req.Header.Set("Referer", "https://www.tumblr.com/blog/"+blog)
+		resp, err := client.Do(req)
+		if err != nil {
+			last = err
+			continue
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		takeCSRF(resp.Header, auth)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		last = fmt.Errorf("%s %s: %s %s", t.method, t.path, resp.Status, truncate(string(b), 160))
+	}
+	if last == nil {
+		return fmt.Errorf("pin failed")
+	}
+	return last
+}
+
+// newPinnedScanPosts is how deep we look for an existing redo intro: reach
+// reblogs bury the pinned post 100-200 posts down, and missing it means a
+// duplicate video post.
+const newPinnedScanPosts = 600
+
+// findNewPinnedCaptionPost looks for the redo pinned intro already on the blog.
+func findNewPinnedCaptionPost(client *http.Client, auth Auth, blog string) (id string, alreadyPinned bool, err error) {
+	for offset := 0; offset < newPinnedScanPosts; offset += 20 {
+		posts, err := fetchBlogPostsPage(client, &auth, blog, 20, offset)
+		if err != nil {
+			if offset > 0 {
+				return "", false, fmt.Errorf("scan for existing pinned post stopped at %d: %w", offset, err)
+			}
+			return "", false, err
+		}
+		if len(posts) == 0 {
+			break
+		}
+		for _, p := range posts {
+			if !isNewPinnedIntro(p) {
+				continue
+			}
+			if pid := postIDFromMap(p); pid != "" {
+				return pid, isPinnedPost(p), nil
+			}
+		}
+	}
+	return "", false, nil
+}
+
+func isNewPinnedIntro(p map[string]any) bool {
+	blob := strings.ToLower(postTextBlob(p))
+	return strings.Contains(blob, "redoing pinned") ||
+		(strings.Contains(blob, "skyrim") && strings.Contains(blob, "beacons.ai/lil.cosmic.bunny"))
+}
+
+func postIDFromMap(m map[string]any) string {
+	if s, ok := m["id_string"].(string); ok && strings.TrimSpace(s) != "" {
+		return strings.TrimSpace(s)
+	}
+	switch v := m["id"].(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	case json.Number:
+		return v.String()
+	}
+	return ""
+}
+
+func postTextBlob(m map[string]any) string {
+	var parts []string
+	for _, k := range []string{"summary", "caption", "body", "title"} {
+		if s, ok := m[k].(string); ok && s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if content, ok := m["content"].([]any); ok {
+		for _, el := range content {
+			blk, ok := el.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s, ok := blk["text"].(string); ok && s != "" {
+				parts = append(parts, s)
+			}
+		}
+	}
+	if trail, ok := m["trail"].([]any); ok {
+		for _, el := range trail {
+			t, ok := el.(map[string]any)
+			if !ok {
+				continue
+			}
+			if c, ok := t["content_raw"].(string); ok {
+				parts = append(parts, c)
+			}
+			if c, ok := t["content"].(string); ok {
+				parts = append(parts, c)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// ensureMediaPinnedOnBlog posts only if needed, then pins (GUI pin API).
+func ensureMediaPinnedOnBlog(client *http.Client, auth *Auth, blogID, imagePath, caption string, pin bool) error {
+	if auth == nil {
+		return fmt.Errorf("missing auth")
+	}
+	auth.Blog = blogID
+	if pin && isNewPinnedIntro(map[string]any{"caption": caption}) {
+		id, pinned, err := findNewPinnedCaptionPost(client, *auth, blogID)
+		if err != nil {
+			return fmt.Errorf("could not check for an existing pinned post (not posting a duplicate): %w", err)
+		}
+		if id != "" {
+			if pinned {
+				fmt.Println("  already posted + pinned", id, "— skipping")
+				return nil
+			}
+			fmt.Println("  already posted", id, "— pinning only (no duplicate)")
+			if err := pinBlogPost(client, auth, id); err != nil {
+				return fmt.Errorf("pin existing post: %w", err)
+			}
+			fmt.Println("Pinned post", id)
+			return nil
+		}
+	}
+	return createPhotoPostOnPinned(client, *auth, blogID, imagePath, caption, pin)
+}
+
+func formTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func createVideoPostLegacy(client *http.Client, auth Auth, imagePath, caption, state string) ([]byte, string, error) {
+	return createLegacyMediaPost(client, auth, imagePath, caption, state, "video", "https://www.tumblr.com/new/video")
+}
+
+func createPhotoPostLegacy(client *http.Client, auth Auth, imagePath, captionHTML, state string) ([]byte, string, error) {
+	return createLegacyMediaPost(client, auth, imagePath, captionHTML, state, "photo", "https://www.tumblr.com/new/photo")
+}
+
+func createLegacyMediaPost(client *http.Client, auth Auth, imagePath, caption, state, typ, referer string) ([]byte, string, error) {
 	file, err := os.Open(imagePath)
 	if err != nil {
 		return nil, "", err
@@ -55,10 +329,10 @@ func createVideoPostLegacy(client *http.Client, auth Auth, imagePath, caption, s
 
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
-	_ = w.WriteField("type", "video")
+	_ = w.WriteField("type", typ)
 	_ = w.WriteField("state", state)
 	if strings.TrimSpace(caption) != "" {
-		_ = w.WriteField("caption", caption)
+		_ = w.WriteField("caption", normalizeCaption(caption))
 	}
 	part, err := w.CreateFormFile("data", filepath.Base(imagePath))
 	if err != nil {
@@ -79,7 +353,7 @@ func createVideoPostLegacy(client *http.Client, auth Auth, imagePath, caption, s
 	setCommonHeaders(req, auth)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	req.Header.Set("X-CSRF", auth.CSRF)
-	req.Header.Set("Referer", "https://www.tumblr.com/new/video")
+	req.Header.Set("Referer", referer)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -91,7 +365,7 @@ func createVideoPostLegacy(client *http.Client, auth Auth, imagePath, caption, s
 		return nil, resp.Status, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return respBody, resp.Status, fmt.Errorf("video post failed: %s — %s", resp.Status, string(respBody))
+		return respBody, resp.Status, fmt.Errorf("%s post failed: %s — %s", typ, resp.Status, string(respBody))
 	}
 	return respBody, resp.Status, nil
 }
@@ -197,6 +471,264 @@ func parseTKHD(payload []byte) (int, int, bool) {
 	return w, h, true
 }
 
+func normalizeCaption(caption string) string {
+	caption = strings.ReplaceAll(caption, "\r\n", "\n")
+	return strings.ReplaceAll(caption, "\r", "\n")
+}
+
+func npfCaptionBlocks(caption string) []map[string]any {
+	caption = normalizeCaption(caption)
+	if strings.TrimSpace(caption) == "" {
+		return nil
+	}
+	lines := strings.Split(caption, "\n")
+	out := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			line = " "
+		}
+		out = append(out, npfTextBlock(line))
+	}
+	return out
+}
+
+// npfTextBlock builds a text block. Supports markdown [label](https://…) links
+// (label can be fancy unicode like 𝓒𝓵𝓲𝓬𝓴𝔂) and auto-linkifies bare http(s) URLs.
+// Formatting offsets are UTF-16 code units (Tumblr NPF).
+func npfTextBlock(line string) map[string]any {
+	text, formatting := npfParseLine(line)
+	blk := map[string]any{"type": "text", "text": text}
+	if len(formatting) > 0 {
+		blk["formatting"] = formatting
+	}
+	return blk
+}
+
+func npfParseLine(line string) (string, []map[string]any) {
+	var out strings.Builder
+	var fmts []map[string]any
+	i := 0
+	for i < len(line) {
+		if line[i] == '[' {
+			if n, label, url, ok := parseMarkdownLink(line[i:]); ok {
+				start := utf16Len(out.String())
+				out.WriteString(label)
+				end := utf16Len(out.String())
+				fmts = append(fmts, map[string]any{
+					"start": start,
+					"end":   end,
+					"type":  "link",
+					"url":   url,
+				})
+				i += n
+				continue
+			}
+		}
+		r, size := utf8.DecodeRuneInString(line[i:])
+		out.WriteRune(r)
+		i += size
+	}
+	text := out.String()
+	covered := make([]bool, utf16Len(text))
+	for _, f := range fmts {
+		start, _ := f["start"].(int)
+		end, _ := f["end"].(int)
+		for j := start; j < end && j < len(covered); j++ {
+			covered[j] = true
+		}
+	}
+	for _, span := range npfURLSpansUTF16(text) {
+		overlap := false
+		for j := span.start; j < span.end && j < len(covered); j++ {
+			if covered[j] {
+				overlap = true
+				break
+			}
+		}
+		if overlap {
+			continue
+		}
+		fmts = append(fmts, map[string]any{
+			"start": span.start,
+			"end":   span.end,
+			"type":  "link",
+			"url":   span.url,
+		})
+	}
+	return text, fmts
+}
+
+func parseMarkdownLink(s string) (consumed int, label, url string, ok bool) {
+	if !strings.HasPrefix(s, "[") {
+		return 0, "", "", false
+	}
+	closeBracket := strings.IndexByte(s, ']')
+	if closeBracket < 1 {
+		return 0, "", "", false
+	}
+	if closeBracket+1 >= len(s) || s[closeBracket+1] != '(' {
+		return 0, "", "", false
+	}
+	closeParen := strings.IndexByte(s[closeBracket+2:], ')')
+	if closeParen < 0 {
+		return 0, "", "", false
+	}
+	label = s[1:closeBracket]
+	url = strings.TrimSpace(s[closeBracket+2 : closeBracket+2+closeParen])
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return 0, "", "", false
+	}
+	if strings.TrimSpace(label) == "" {
+		return 0, "", "", false
+	}
+	consumed = closeBracket + 2 + closeParen + 1
+	return consumed, label, url, true
+}
+
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		n += utf16.RuneLen(r)
+	}
+	return n
+}
+
+type npfURLSpan struct {
+	start, end int
+	url        string
+}
+
+func npfURLSpans(s string) []npfURLSpan {
+	// Kept for older tests; prefer UTF-16 spans for NPF.
+	return npfURLSpansUTF16(s)
+}
+
+func npfURLSpansUTF16(s string) []npfURLSpan {
+	var out []npfURLSpan
+	runes := []rune(s)
+	i := 0
+	for i < len(runes) {
+		rest := string(runes[i:])
+		idx := strings.Index(rest, "https://")
+		scheme := "https://"
+		if idx < 0 {
+			idx = strings.Index(rest, "http://")
+			scheme = "http://"
+		}
+		if idx < 0 {
+			break
+		}
+		// idx is byte offset into rest; convert to rune index from i.
+		runeIdx := i + len([]rune(rest[:idx]))
+		schemeRunes := []rune(scheme)
+		j := runeIdx + len(schemeRunes)
+		for j < len(runes) {
+			c := runes[j]
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '<' || c == '>' || c == '"' {
+				break
+			}
+			j++
+		}
+		end := j
+		for end > runeIdx+len(schemeRunes) {
+			c := runes[end-1]
+			if c == '.' || c == ',' || c == ';' || c == ':' || c == ')' || c == ']' || c == '!' || c == '?' {
+				end--
+				continue
+			}
+			break
+		}
+		url := string(runes[runeIdx:end])
+		if len(url) > len(scheme) {
+			startU16 := utf16Len(string(runes[:runeIdx]))
+			endU16 := utf16Len(string(runes[:end]))
+			out = append(out, npfURLSpan{start: startU16, end: endU16, url: url})
+		}
+		i = end
+	}
+	return out
+}
+
+// zoeyNewPinnedCaption is the pinned intro with fancy Clicky → beacons.
+func zoeyNewPinnedCaption() string {
+	clicky := "𝓒𝓵𝓲𝓬𝓴𝔂"
+	return strings.Join([]string{
+		"Hiii 🥰",
+		"",
+		"i'm zoey, i'm 25 and 5'4, and im obsessed with the gym, skyrim and art 🥰",
+		"",
+		"i'm new here so figuring it out, feel free to say hello 🥰🥰",
+		"",
+		"[" + clicky + "](" + beaconsLink + ")",
+		"#d4ddys slvt",
+		"#anime and manga",
+		"#art",
+		"#attractive",
+		"#attractive blonde woman",
+		"#attractive body types women",
+		"#attractive girls",
+		"#attractive woman",
+		"#attractive young lady",
+		"#beautiful model",
+		"#dd lg babygirl",
+		"#dd lg blog",
+		"#dd lg brat",
+		"#ddlglittle",
+		"#dd/lg princess",
+		"#dd/lg brat",
+		"#dd/lg breeding",
+		"#curvy model",
+		"#bikini model",
+		"#follow my onlyfans",
+		"#only f@nz",
+		"#onlyfans sale",
+		"#onlyfans subscription",
+		"#girl",
+		"#good girl thoughts",
+		"#good girl training",
+		"#good girls don't think",
+		"#good girls get wet",
+		"#good girls obey",
+		"#good girls rub their minds away",
+	}, "\n")
+}
+
+// captionToLegacyHTML turns markdown [label](url) lines into HTML anchors for
+// the legacy video /post endpoint (NPF formatting is not available there).
+func captionToLegacyHTML(caption string) string {
+	caption = normalizeCaption(caption)
+	if strings.TrimSpace(caption) == "" {
+		return ""
+	}
+	var parts []string
+	for _, line := range strings.Split(caption, "\n") {
+		if strings.TrimSpace(line) == "" {
+			parts = append(parts, "<br/>")
+			continue
+		}
+		var b strings.Builder
+		i := 0
+		for i < len(line) {
+			if line[i] == '[' {
+				if n, label, url, ok := parseMarkdownLink(line[i:]); ok {
+					b.WriteString(`<a href="`)
+					b.WriteString(html.EscapeString(url))
+					b.WriteString(`">`)
+					b.WriteString(html.EscapeString(label))
+					b.WriteString(`</a>`)
+					i += n
+					continue
+				}
+			}
+			r, size := utf8.DecodeRuneInString(line[i:])
+			b.WriteString(html.EscapeString(string(r)))
+			i += size
+		}
+		parts = append(parts, "<p>"+b.String()+"</p>")
+	}
+	return strings.Join(parts, "")
+}
+
 func createPhotoPostState(client *http.Client, auth Auth, imagePath, caption, state string) ([]byte, string, error) {
 	file, err := os.Open(imagePath)
 	if err != nil {
@@ -230,11 +762,7 @@ func createPhotoPostState(client *http.Client, auth Auth, imagePath, caption, st
 	var content []map[string]any
 	var layoutDisplay []map[string]any
 	block := 0
-	if strings.TrimSpace(caption) != "" {
-		content = append(content, map[string]any{"type": "text", "text": caption})
-		layoutDisplay = append(layoutDisplay, map[string]any{"blocks": []int{block}})
-		block++
-	}
+	// Image/video first so the post reads like the tumblr UI (media on top).
 	if video {
 		media := map[string]any{
 			"type":       mimeType,
@@ -265,19 +793,21 @@ func createPhotoPostState(client *http.Client, auth Auth, imagePath, caption, st
 		})
 	}
 	layoutDisplay = append(layoutDisplay, map[string]any{"blocks": []int{block}})
+	block++
+	for _, blk := range npfCaptionBlocks(caption) {
+		content = append(content, blk)
+		layoutDisplay = append(layoutDisplay, map[string]any{"blocks": []int{block}})
+		block++
+	}
 
 	payload := map[string]any{
-		"state":   state,
-		"content": content,
-	}
-	if !video {
-		payload["hide_trail"] = false
-		payload["tags"] = ""
-		payload["layout"] = []map[string]any{
-			{"type": "rows", "display": layoutDisplay},
-		}
-		payload["has_community_label"] = false
-		payload["community_label_categories"] = []any{}
+		"state":                      state,
+		"content":                    content,
+		"hide_trail":                 false,
+		"tags":                       "",
+		"layout":                     []map[string]any{{"type": "rows", "display": layoutDisplay}},
+		"has_community_label":        false,
+		"community_label_categories": []any{},
 	}
 
 	jsonBytes, err := json.Marshal(payload)
@@ -287,9 +817,7 @@ func createPhotoPostState(client *http.Client, auth Auth, imagePath, caption, st
 
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
-	if !video {
-		_ = w.SetBoundary("TumblrBoundary")
-	}
+	_ = w.SetBoundary("TumblrBoundary")
 
 	jsonHeader := textproto.MIMEHeader{}
 	jsonHeader.Set("Content-Disposition", `form-data; name="json"`)
@@ -317,10 +845,8 @@ func createPhotoPostState(client *http.Client, auth Auth, imagePath, caption, st
 		return nil, "", err
 	}
 
+	// NPF always uses /posts — /post is legacy and treats NPF video as empty.
 	postURL := "https://www.tumblr.com/api/v2/blog/" + auth.Blog + "/posts"
-	if video {
-		postURL = "https://www.tumblr.com/api/v2/blog/" + auth.Blog + "/post"
-	}
 	req, err := http.NewRequest("POST", postURL, bytes.NewReader(body.Bytes()))
 	if err != nil {
 		return nil, "", err
@@ -499,18 +1025,104 @@ func runInteractivePhotoPost() error {
 }
 
 func publishMediaOnUniqueBlogs(path, caption string) error {
+	return publishMediaOnUniqueBlogsPinned(path, caption, false)
+}
+
+func publishMediaOnUniqueBlogsPinned(path, caption string, pin bool) error {
 	fmt.Println("Posting", filepath.ToSlash(path), "on every distinct Tumblr blog…")
+	if pin {
+		fmt.Println("Pinning each post after publish")
+	}
 	if caption != "" {
 		fmt.Println("Caption:", truncate(caption, 120))
 	}
 
 	seenBlog := map[string]string{}
 	return runForEachUniqueBlog("photo post", func() error {
-		return postPhotoOnAllBlogs(path, caption, seenBlog)
+		return postPhotoOnAllBlogsPinned(path, caption, seenBlog, pin)
+	})
+}
+
+func publishMediaOnFirstLoggedInBlogs(path, caption string, n int) error {
+	return publishMediaOnFirstLoggedInBlogsPinned(path, caption, n, false)
+}
+
+func publishMediaOnFirstLoggedInBlogsPinned(path, caption string, n int, pin bool) error {
+	accs := loggedInUniqueAccounts(n)
+	fmt.Printf("Posting %s on the first %d logged-in blogs (%d found)\n", filepath.ToSlash(path), n, len(accs))
+	if pin {
+		fmt.Println("Pinning each post after publish")
+	}
+	if caption != "" {
+		fmt.Println("Caption:", truncate(caption, 120))
+	}
+	for i, a := range accs {
+		fmt.Printf("  %d) %s\n", i+1, a.ID)
+	}
+	seenBlog := map[string]string{}
+	return runForEachAccountList("photo post", accs, func() error {
+		return postPhotoOnAllBlogsPinned(path, caption, seenBlog, pin)
+	})
+}
+
+// publishMediaOnTopFollowerBlogs posts (and optionally pins) on the N logged-in
+// accounts with the most followers (unique blogs).
+func publishMediaOnTopFollowerBlogs(path, caption string, n int, pin bool) error {
+	accs := loggedInTopFollowerAccounts(n)
+	fmt.Printf("Posting %s on top %d follower blogs (%d found)\n", filepath.ToSlash(path), n, len(accs))
+	if pin {
+		fmt.Println("Pinning each post after publish")
+	}
+	if caption != "" {
+		fmt.Println("Caption:", truncate(caption, 160))
+	}
+	for i, a := range accs {
+		auth := peekAccountAuth(a.ID)
+		blog, fol := bestAccountBlogStats(a.ID, loadFollowerLog(a.ID))
+		if blog == "" {
+			blog = auth.Blog
+		}
+		fmt.Printf("  %d) %s  @%s  %d followers\n", i+1, a.ID, blog, fol)
+	}
+	seenBlog := map[string]string{}
+	return runForEachAccountList("photo post", accs, func() error {
+		return postPhotoOnAllBlogsPinned(path, caption, seenBlog, pin)
+	})
+}
+
+// publishMediaOnFullySetupBlogs posts (and optionally pins) on every account in
+// config/zoey-fully-setup.json that is still logged in.
+func publishMediaOnFullySetupBlogs(path, caption string, pin bool) error {
+	accs := loggedInFullySetupAccounts()
+	fmt.Printf("Posting %s on %d fully-setup blogs\n", filepath.ToSlash(path), len(accs))
+	if pin {
+		fmt.Println("Pinning each post after publish")
+	}
+	if caption != "" {
+		fmt.Println("Caption:", truncate(caption, 160))
+	}
+	for i, a := range accs {
+		auth := peekAccountAuth(a.ID)
+		blog, fol := bestAccountBlogStats(a.ID, loadFollowerLog(a.ID))
+		if blog == "" {
+			blog = auth.Blog
+		}
+		fmt.Printf("  %d) %s  @%s  %d followers\n", i+1, a.ID, blog, fol)
+	}
+	if len(accs) == 0 {
+		return fmt.Errorf("no fully-setup logged-in accounts")
+	}
+	seenBlog := map[string]string{}
+	return runForEachAccountList("photo post", accs, func() error {
+		return postPhotoOnAllBlogsPinned(path, caption, seenBlog, pin)
 	})
 }
 
 func postPhotoOnAllBlogs(imagePath, caption string, seenBlog map[string]string) error {
+	return postPhotoOnAllBlogsPinned(imagePath, caption, seenBlog, false)
+}
+
+func postPhotoOnAllBlogsPinned(imagePath, caption string, seenBlog map[string]string, pin bool) error {
 	auth, err := loadAuth()
 	if err != nil {
 		return err
@@ -519,11 +1131,14 @@ func postPhotoOnAllBlogs(imagePath, caption string, seenBlog map[string]string) 
 		return fmt.Errorf("not logged in")
 	}
 	acc, _ := currentAccount()
-	client := newHumanClient()
+	client := newAuthClient(&auth)
 	if isVideoPath(imagePath) {
 		client.Timeout = 3 * time.Minute
 	}
 	if err := ensureSession(client, &auth); err != nil {
+		return err
+	}
+	if _, err := syncAuthIdentity(client, &auth); isForeignBlogSession(err) {
 		return err
 	}
 
@@ -556,15 +1171,15 @@ func postPhotoOnAllBlogs(imagePath, caption string, seenBlog map[string]string) 
 		if b.Primary {
 			label += " (primary)"
 		}
-		fmt.Println("Posting to", label)
+		fmt.Println("Ensuring pinned post on", label)
 		blogID := b.Name
 		if blogID == "" {
 			blogID = b.UUID
 		}
-		err := createPhotoPostOn(client, auth, blogID, imagePath, caption)
+		err := ensureMediaPinnedOnBlog(client, &auth, blogID, imagePath, caption, pin)
 		if isCookieProblem(err) {
 			err = retryAfterCookie(client, &auth, nil, acc.ID, err, func() error {
-				return createPhotoPostOn(client, auth, blogID, imagePath, caption)
+				return ensureMediaPinnedOnBlog(client, &auth, blogID, imagePath, caption, pin)
 			})
 		}
 		if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate") {

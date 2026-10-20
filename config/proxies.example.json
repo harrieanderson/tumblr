@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "stickyMinutes": 45,
+  "minRequestGapMs": 900,
+  "perProxyMaxConcurrent": 2,
+  "perAccountMaxPerMinute": 18,
+  "perProxyMaxPerMinute": 36,
+  "respectRetryAfter": true,
+  "backoff": {
+    "initialSeconds": 8,
+    "maxSeconds": 900,
+    "multiplier": 2,
+    "jitterPercent": 25
+  },
+  "proxies": [
+    {
+      "label": "us-1",
+      "url": "http://USER:PASS@proxy1.example.com:8080"
+    },
+    {
+      "label": "us-2",
+      "url": "http://USER:PASS@proxy2.example.com:8080"
+    },
+    {
+      "label": "eu-1",
+      "url": "socks5://USER:PASS@proxy3.example.com:1080"
+    }
+  ]
+}

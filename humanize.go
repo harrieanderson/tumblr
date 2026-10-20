@@ -63,7 +63,7 @@ func runHumanize() {
 		}
 	}
 
-	client := newHumanClient()
+	client := newAuthClient(&auth)
 	if err := ensureSession(client, &auth); err != nil {
 		fmt.Println("Session dead — trying auto-login…")
 		if err := loginWithRealChrome(&auth); err != nil {
@@ -75,7 +75,7 @@ func runHumanize() {
 			return
 		}
 	}
-	warmSession(client, &auth)
+	warmSession(client, &auth, "", nil)
 
 	followCfg := loadFollowConfig()
 	// Cap session follows even lower than follow.json for brand-new human pacing.
@@ -131,7 +131,7 @@ func runHumanize() {
 			}
 			fmt.Println("\n--- Checking Messages inbox ---")
 			msgCfg := loadMessageConfig()
-			n, err := messageInboxBurst(client, &auth, msgCfg)
+			n, err := messageInboxBurst(client, &auth, msgCfg, auth.Blog, accountIDFromAuth(auth))
 			if err != nil {
 				fmt.Println("  messages fail:", err)
 				if isForbidden(err) || isUnauthorized(err) {

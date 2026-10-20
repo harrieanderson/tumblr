@@ -2,6 +2,7 @@ pics/
 pics/posted/
 config/auth.json
 config/credentials.json
+config/proxies.json
 config/active-account.json
 config/profiles/
 chrome-data/
@@ -12,3 +13,5 @@ tumblr.exe
 .env
 Thumbs.db
 Desktop.ini
+
+config/x-cookie.txt

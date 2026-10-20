@@ -12,13 +12,17 @@ import (
 )
 
 type BlogProfile struct {
-	Name        string
-	Title       string
-	Description string
-	Avatar      string
-	Updated     int64
-	TotalPosts  int
-	Followers   int
+	Name            string
+	Title           string
+	Description     string
+	Avatar          string
+	Updated         int64
+	TotalPosts      int
+	Followers       int
+	BackgroundColor string
+	AccentColor     string
+	HeaderImage     string
+	ShowHeaderImage bool
 }
 
 var (
@@ -68,14 +72,19 @@ func fetchBlogProfile(client *http.Client, auth Auth, blog string) (BlogProfile,
 		b = response
 	}
 
+	theme, _ := b["theme"].(map[string]any)
 	p := BlogProfile{
-		Name:        firstNonEmpty(anyToString(b["name"]), blog),
-		Title:       anyToString(b["title"]),
-		Description: stripHTML(anyToString(b["description"])),
-		Avatar:      blogAvatarURL(b),
-		Updated:     anyToInt64(b["updated"]),
-		TotalPosts:  anyToInt(b["totalPosts"]),
-		Followers:   mapFollowers(b),
+		BackgroundColor: anyToString(theme["backgroundColor"]),
+		AccentColor:     anyToString(theme["linkColor"]),
+		HeaderImage:     anyToString(theme["headerImage"]),
+		ShowHeaderImage: theme["showHeaderImage"] == true,
+		Name:            firstNonEmpty(anyToString(b["name"]), blog),
+		Title:           anyToString(b["title"]),
+		Description:     stripHTML(anyToString(b["description"])),
+		Avatar:          blogAvatarURL(b),
+		Updated:         anyToInt64(b["updated"]),
+		TotalPosts:      anyToInt(b["totalPosts"]),
+		Followers:       mapFollowers(b),
 	}
 	if p.TotalPosts == 0 {
 		p.TotalPosts = anyToInt(b["total_posts"])
@@ -167,6 +176,9 @@ type filterResult struct {
 }
 
 func shouldFollowBlog(client *http.Client, auth Auth, blog string, cfg FollowConfig) filterResult {
+	if isBlockedMinor(blog) {
+		return filterResult{OK: false, Reason: "under 18 — never touching", Gender: "unknown"}
+	}
 	p, err := fetchBlogProfile(client, auth, blog)
 	if err != nil {
 		// If info fails, don't hard-block — just note it.
@@ -175,6 +187,11 @@ func shouldFollowBlog(client *http.Client, auth Auth, blog string, cfg FollowCon
 
 	active := blogIsActive(p, cfg.RequireActiveDays)
 	gender := genderGuess(p)
+
+	if bioSuggestsMinor(p) {
+		blockMinor(blog, "", fmt.Sprintf("bio says under 18: %q", strings.TrimSpace(p.Title+" | "+p.Description)))
+		return filterResult{OK: false, Reason: "under 18 — never touching", Gender: gender, Active: active}
+	}
 
 	if cfg.RequireActiveDays > 0 && !active {
 		return filterResult{OK: false, Reason: fmt.Sprintf("inactive (last update %s)", time.Unix(p.Updated, 0).Format("2006-01-02")), Gender: gender, Active: false}
@@ -191,4 +208,16 @@ func shouldFollowBlog(client *http.Client, auth Auth, blog string, cfg FollowCon
 	// preferMale: unknowns are allowed (most blogs have no pronouns).
 	reason := fmt.Sprintf("gender=%s active=%v", gender, active)
 	return filterResult{OK: true, Reason: reason, Gender: gender, Active: active}
+}
+
+// isSoftFollowReject is a gender/activity miss — do not stamp into the shared
+// interacted list so we can retry them on a later day.
+func isSoftFollowReject(fr filterResult) bool {
+	if fr.OK {
+		return false
+	}
+	r := strings.ToLower(fr.Reason)
+	return strings.Contains(r, "female") ||
+		strings.Contains(r, "inactive") ||
+		strings.Contains(r, "not male")
 }

@@ -203,19 +203,36 @@ func pickFreeDebugPort(preferred string) string {
 }
 
 func stopChrome(cmd *exec.Cmd) {
-	closeBotChrome()
+	stopChromeOpts(cmd, true)
+}
+
+// stopChromeOpts closes bot Chrome. When polite is false (batch setup), skip the
+// CDP browser.Close wait — that is what left Tumblr sitting on the finished page.
+func stopChromeOpts(cmd *exec.Cmd, polite bool) {
+	port := liveDebugPort
+	pid := liveChromePID
+	if cmd != nil && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	if polite {
+		closeBotChrome()
+	} else {
+		detachLiveChrome()
+	}
 	liveDebugPort = ""
 	liveChromeAccount = ""
 	liveChromePID = 0
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
 	if runtime.GOOS == "windows" {
-		_ = exec.Command("taskkill", "/PID", strconv.Itoa(cmd.Process.Pid), "/T", "/F").Run()
+		if pid > 0 {
+			_ = exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/T", "/F").Run()
+		}
+		killListenersOnPort(port)
 		return
 	}
-	_ = cmd.Process.Kill()
-	_ = cmd.Wait()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
 }
 
 // ensureFreshChromeForAccount closes any leftover bot Chrome for this profile
@@ -324,6 +341,23 @@ func parseNetstatListeningPIDs(out, port string) []int {
 	return pids
 }
 
+// killBotDebugChromes force-kills Chrome for THIS account's debug port only.
+// Never wipe the whole 93xx range — parallel setup lanes share that band.
+func killBotDebugChromes() {
+	port := strings.TrimSpace(liveDebugPort)
+	if port == "" {
+		port = strings.TrimSpace(currentDebugPort())
+	}
+	if port != "" {
+		killListenersOnPort(port)
+	}
+	if id := strings.TrimSpace(liveChromeAccount); id != "" {
+		if dir, err := chromeDirForAccount(id); err == nil {
+			killChromeWithUserDataDir(dir)
+		}
+	}
+}
+
 func killChromeWithUserDataDir(dir string) {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
@@ -334,12 +368,26 @@ func killChromeWithUserDataDir(dir string) {
 		dir = abs
 	}
 	if runtime.GOOS == "windows" {
-		// Match chrome.exe whose command line includes this profile dir.
+		// Match by full path and by profiles\<id> fragment (path separators vary).
+		needle := strings.ToLower(filepath.ToSlash(dir))
+		base := strings.ToLower(filepath.Base(dir))
+		frag := strings.ToLower(filepath.ToSlash(filepath.Join("profiles", base)))
 		ps := fmt.Sprintf(
-			`$d = %s; Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($d.ToLower()) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
-			strconv.Quote(dir),
+			`$needles = @(%s, %s); Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ForEach-Object { $cl = $_.CommandLine; if (-not $cl) { return }; $n = $cl.ToLower().Replace('\','/'); foreach ($d in $needles) { if ($d -and $n.Contains($d)) { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; break } } }`,
+			strconv.Quote(needle),
+			strconv.Quote(frag),
 		)
-		_ = exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
+		cmd := exec.Command("powershell", "-NoProfile", "-Command", ps)
+		_ = cmd.Start()
+		done := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}
 		return
 	}
 	out, err := exec.Command("ps", "aux").Output()
@@ -489,6 +537,9 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 	if err != nil {
 		return nil, err
 	}
+	if err := verifyLaunchedChrome(chrome); err != nil {
+		return nil, err
+	}
 
 	detachLiveChrome()
 
@@ -521,6 +572,9 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 
 	markChromeCleanExit(dir)
 
+	// EA / games routinely leave <2GB free; Tumblr then Aw-Snaps with Out of Memory.
+	waitForChromeMemoryHeadroom(2500, 90*time.Second)
+
 	startURL := "https://www.tumblr.com/login"
 	if auto {
 		fmt.Println("Opening Tumblr login…")
@@ -542,14 +596,34 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		"--noerrdialogs",
 		"--disable-save-password-bubble",
 		"--password-store=basic",
-		"--disable-features=PasswordManager,PasswordLeakDetection,PasswordCheck,PasswordManagerOnboarding,SafetyCheck,SafetyHub,SafetyTip",
+		"--disable-features=PasswordManager,PasswordLeakDetection,PasswordCheck,PasswordManagerOnboarding,SafetyCheck,SafetyHub,SafetyTip,IsolateOrigins,site-per-process,TranslateUI,MediaRouter,CalculateNativeWinOcclusion",
+		// Keep bot Chrome lean — EA/games often leave <2GB free and Tumblr OOMs.
+		"--disable-extensions",
+		"--disable-component-extensions-with-background-pages",
+		"--disable-background-networking",
+		"--disable-background-timer-throttling",
+		"--disable-renderer-backgrounding",
+		"--disable-ipc-flooding-protection",
+		"--disable-sync",
+		"--disable-default-apps",
+		"--disable-hang-monitor",
+		"--metrics-recording-only",
+		"--no-pings",
+		"--renderer-process-limit=3",
+		"--process-per-site",
+		"--disk-cache-size=33554432",
+		"--media-cache-size=8388608",
+		"--js-flags=--max-old-space-size=384",
 	}
+	fp := fingerprint()
+	args = append(args, fp.langArg())
 	if hidden {
 		args = append(args, headlessChromeArgs(chrome)...)
 	}
 	if !hidden {
-		// Make Watch/monitor windows obvious on the desktop.
-		args = append(args, "--start-maximized", "--window-position=80,40")
+		// Visible but don't maximize — Harrie often has other work on-screen.
+		// Window size matches the shared fingerprint (same as headless/API claims).
+		args = append(args, fp.windowSizeArg(), "--window-position=80,40")
 	}
 	cmd := exec.Command(chrome, append(args, startURL)...)
 	if err := cmd.Start(); err != nil {
@@ -586,6 +660,9 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		stopChrome(cmd)
 		return nil, err
 	}
+	if !hidden {
+		raiseLiveChromeWindow(id)
+	}
 
 	if setupUILog != nil {
 		setupSay("Waiting for the Tumblr browser session...")
@@ -598,13 +675,16 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 	switch {
 	case hasSid && !forceForm:
 		fmt.Println("Already logged in — syncing cookies…")
+		_ = os.Stdout.Sync()
 	case auto && forceForm:
 		fmt.Println("API rejected this session — logging out of Chrome and signing in again…")
+		_ = os.Stdout.Sync()
 		if err := finishChromeLoginWait(cmd, reloginTumblrInChrome(creds)); err != nil {
 			return nil, err
 		}
 	case auto:
 		fmt.Println("Not logged in — auto-filling Tumblr login…")
+		_ = os.Stdout.Sync()
 		if err := finishChromeLoginWait(cmd, autoFillTumblrLogin(creds)); err != nil {
 			return nil, err
 		}
@@ -620,7 +700,15 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		}
 	}
 
-	cookies, err := cookiesFromDebugPort()
+	// Fast path: dashboard already up — don't stall on CDP cookie scrape,
+	// saveAuth guards, or proxy CSRF. Setup drives Tumblr through Chrome.
+	if chromeLooksLoggedIn() {
+		fmt.Println("Chrome session ready — continuing.")
+		_ = os.Stdout.Sync()
+		return cmd, nil
+	}
+
+	cookies, err := cookiesFromDebugPortTimed(5 * time.Second)
 	sid := ""
 	if err == nil {
 		sid = cookieValue(cookies, "sid")
@@ -632,6 +720,9 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 				return nil, err
 			}
 		}
+	} else {
+		fmt.Println("Cookie sync:", err)
+		_ = os.Stdout.Sync()
 	}
 	if sid == "" {
 		if !chromeLooksLoggedIn() {
@@ -642,10 +733,15 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 			return nil, fmt.Errorf("still no sid cookie — login did not complete")
 		}
 		fmt.Println("Could not read sid yet, but Chrome is logged in — continuing.")
+		_ = os.Stdout.Sync()
+		return cmd, nil
 	}
 
-	client := newAuthClient(auth)
 	if sid != "" {
+		client := newAuthClient(auth)
+		if client != nil && client.Timeout > 12*time.Second {
+			client.Timeout = 12 * time.Second
+		}
 		if err := refreshCSRF(client, auth); err != nil {
 			fmt.Println("CSRF refresh warning:", err)
 			if !forceForm && auto {
@@ -669,64 +765,14 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 					stopChrome(cmd)
 					return nil, err
 				}
-				if err := refreshCSRF(client, auth); err != nil {
-					stopChrome(cmd)
-					return nil, fmt.Errorf("Tumblr still unauthorized after login: %w", err)
-				}
 			} else {
 				stopChrome(cmd)
 				return nil, fmt.Errorf("Tumblr still unauthorized after login: %w", err)
 			}
 		}
 		if name, err := syncAuthIdentity(client, auth); err != nil {
-			if isForeignBlogSession(err) {
-				fmt.Println("Chrome has the wrong Tumblr account — logging out and signing in as", id, "…")
-				if auto {
-					if err := finishChromeLoginWait(cmd, reloginTumblrInChrome(creds)); err != nil {
-						stopChrome(cmd)
-						return nil, err
-					}
-				} else {
-					_ = chromeLogoutOnly()
-					fmt.Println("Waiting up to 3 minutes for the correct login in Chrome…")
-					if err := waitForTumblrSession(3 * time.Minute); err != nil {
-						stopChrome(cmd)
-						return nil, fmt.Errorf("login did not complete: %w", err)
-					}
-				}
-				cookies, err = cookiesFromDebugPort()
-				if err != nil {
-					stopChrome(cmd)
-					return nil, err
-				}
-				if cookieValue(cookies, "sid") == "" {
-					stopChrome(cmd)
-					return nil, fmt.Errorf("still no sid cookie — login did not complete")
-				}
-				auth.Cookie = buildTumblrCookieHeader(cookies)
-				persistMaturePref(auth)
-				if err := saveAuth(*auth); err != nil {
-					stopChrome(cmd)
-					return nil, err
-				}
-				if err := refreshCSRF(client, auth); err != nil {
-					stopChrome(cmd)
-					return nil, fmt.Errorf("Tumblr still unauthorized after login: %w", err)
-				}
-				name, err = syncAuthIdentity(client, auth)
-				if err != nil {
-					stopChrome(cmd)
-					return nil, err
-				}
-				fmt.Println("Active blog:", name, "("+auth.Blog+")")
-			} else {
-				maybeFillBlog(client, auth)
-				if name2, err2 := syncAuthIdentity(client, auth); err2 != nil {
-					fmt.Println("Could not detect blog identity yet:", err)
-				} else {
-					fmt.Println("Active blog:", name2, "("+auth.Blog+")")
-				}
-			}
+			maybeFillBlog(client, auth)
+			fmt.Println("Could not detect blog identity yet:", err)
 		} else {
 			fmt.Println("Active blog:", name, "("+auth.Blog+")")
 		}
@@ -740,6 +786,9 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 }
 
 func loginWaitBudget() time.Duration {
+	if headlessChrome {
+		return 20 * time.Second // cannot solve captcha — don't park the batch
+	}
 	if quietChromeLogin {
 		return 90 * time.Second
 	}
@@ -770,9 +819,15 @@ func finishChromeLoginWait(cmd *exec.Cmd, fillErr error) error {
 		_ = discardDeadLogin(b.Email)
 		return fillErr
 	}
+	// Headless cannot clear captcha — close and let setup move to the next account.
+	if fillErr != nil && headlessChrome && strings.Contains(strings.ToLower(fillErr.Error()), "captcha") {
+		fmt.Println("Headless login blocked by captcha — closing Chrome, next account.")
+		stopChromeOpts(cmd, false)
+		return fillErr
+	}
 	if fillErr != nil {
 		fmt.Println("Login not finished yet:", fillErr)
-		if !quietChromeLogin {
+		if !quietChromeLogin && !headlessChrome {
 			fmt.Println("Chrome stays open. Finish captcha/2FA in the window if it appears — I will not close it early.")
 		}
 	} else {
@@ -1032,24 +1087,49 @@ const tumblrLoginHydratedJS = `(() => {
 })()`
 
 const tumblrCaptchaVisibleJS = `(() => {
+	const vis = (el, minW, minH) => {
+		if (!el) return false;
+		const s = getComputedStyle(el);
+		if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+		const r = el.getBoundingClientRect();
+		return r.width > minW && r.height > minH;
+	};
+	const body = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+	// Visible "I'm not a robot" / "Check the box above to continue" on Tumblr login.
+	if (/i('| a)?m not a robot|check the box above to continue/i.test(body)) return true;
+	// Anchor widget is ~300x74; ignore tiny invisible recaptcha iframes.
+	const challengeFrame = [...document.querySelectorAll('iframe')].find(f => {
+		const meta = ((f.src || '') + ' ' + (f.title || '') + ' ' + (f.name || '')).toLowerCase();
+		if (!/recaptcha|hcaptcha|arkoselabs|funcaptcha|challenge/i.test(meta)) return false;
+		if (/api2\/anchor|recaptcha\/enterprise\/anchor|title=\"recaptcha\"/i.test(meta) || /recaptcha/i.test(f.title || '')) {
+			return vis(f, 100, 40);
+		}
+		return vis(f, 120, 60);
+	});
+	if (challengeFrame) return true;
+	const explicit = [...document.querySelectorAll('[role="dialog"], main, section, h1, h2, p, div')]
+		.filter(el => vis(el, 40, 10))
+		.map(el => (el.innerText || '').replace(/\s+/g, ' ').trim())
+		.find(t => t && t.length < 240 && /verify you are (a )?human|complete the captcha|unusual traffic|security challenge|i('| a)?m not a robot|check the box above/i.test(t));
+	return !!explicit;
+})()`
+
+// tumblrRecaptchaAnchorBoxJS returns {x,y,w,h} of the visible reCAPTCHA checkbox iframe, or null.
+const tumblrRecaptchaAnchorBoxJS = `(() => {
 	const vis = (el) => {
 		if (!el) return false;
 		const s = getComputedStyle(el);
 		if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
 		const r = el.getBoundingClientRect();
-		return r.width > 120 && r.height > 60;
+		return r.width > 100 && r.height > 40;
 	};
-	// Tumblr loads an invisible reCAPTCHA iframe on the ordinary login form.
-	// Its URL contains "recaptcha", but that is not a challenge and must not
-	// suppress refilling an empty email/password form.
-	const challengeFrame = [...document.querySelectorAll('iframe')].find(f =>
-		vis(f) && /recaptcha|hcaptcha|arkoselabs|funcaptcha|challenge/i.test((f.src || '') + ' ' + (f.title || '')));
-	if (challengeFrame) return true;
-	const explicit = [...document.querySelectorAll('[role="dialog"], main, section, h1, h2, p, div')]
-		.filter(vis)
-		.map(el => (el.innerText || '').replace(/\s+/g, ' ').trim())
-		.find(t => t && t.length < 240 && /verify you are (a )?human|complete the captcha|unusual traffic|security challenge/i.test(t));
-	return !!explicit;
+	const f = [...document.querySelectorAll('iframe')].find(el => {
+		const meta = ((el.src || '') + ' ' + (el.title || '')).toLowerCase();
+		return vis(el) && /recaptcha/i.test(meta) && (/anchor/i.test(meta) || /recaptcha/i.test(el.title || ''));
+	});
+	if (!f) return null;
+	const r = f.getBoundingClientRect();
+	return { x: r.x, y: r.y, w: r.width, h: r.height };
 })()`
 
 const tumblrLoginNeedsRefillJS = `(() => {
@@ -1207,6 +1287,9 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 	if filled != "ok" {
 		return fmt.Errorf("login form: no visible password field")
 	}
+	if evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
+		return waitOutLoginCaptcha(ctx, email)
+	}
 	if err := clickTumblrLoginButton(ctx); err != nil {
 		return err
 	}
@@ -1220,6 +1303,9 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 		}
 		if evalBoolJS(ctx, tumblrLoginErrorJS) {
 			return badLoginError{Email: email, ID: accountSlug(email)}
+		}
+		if evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
+			return waitOutLoginCaptcha(ctx, email)
 		}
 		var href string
 		_ = chromedp.Location(&href).Do(ctx)
@@ -1237,12 +1323,84 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 	if evalBoolJS(ctx, tumblrLoginErrorJS) {
 		return badLoginError{Email: email, ID: accountSlug(email)}
 	}
+	if evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
+		return waitOutLoginCaptcha(ctx, email)
+	}
 	var href string
 	_ = chromedp.Location(&href).Do(ctx)
 	if loginFillDone(href, cookieOK(ctx)) {
 		return nil
 	}
 	return fmt.Errorf("still on login page")
+}
+
+// waitOutLoginCaptcha tries the I'm-not-a-robot box once, then waits for Harrie
+// (or the challenge) so we don't spin-refill the form over the captcha.
+func waitOutLoginCaptcha(ctx context.Context, email string) error {
+	fmt.Println("reCAPTCHA on the login form — click \"I'm not a robot\" in Chrome if it isn't already checked.")
+	_ = os.Stdout.Sync()
+	_ = clickRecaptchaCheckboxIfPresent(ctx)
+	waitFor := 3 * time.Minute
+	if headlessChrome {
+		// Headless cannot solve captchas — fail fast so parallel setup moves on.
+		waitFor = 12 * time.Second
+	}
+	deadline := time.Now().Add(waitFor)
+	lastNudge := time.Time{}
+	for time.Now().Before(deadline) {
+		var href string
+		_ = chromedp.Location(&href).Do(ctx)
+		if loginFillDone(href, cookieOK(ctx)) {
+			fmt.Println("Captcha cleared — logged in.")
+			return nil
+		}
+		if evalBoolJS(ctx, tumblrLoginErrorJS) {
+			return badLoginError{Email: email, ID: accountSlug(email)}
+		}
+		if evalBoolJS(ctx, tumblrPasswordChangeRequiredJS) {
+			return passwordChangeRequiredError{Email: email, ID: accountSlug(email)}
+		}
+		if !evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
+			// Checkbox done / challenge gone — try Log in.
+			_ = clickTumblrLoginButton(ctx)
+			time.Sleep(1500 * time.Millisecond)
+			_ = chromedp.Location(&href).Do(ctx)
+			if loginFillDone(href, cookieOK(ctx)) {
+				fmt.Println("Captcha cleared — logged in.")
+				return nil
+			}
+		} else if lastNudge.IsZero() || time.Since(lastNudge) > 45*time.Second {
+			lastNudge = time.Now()
+			if headlessChrome {
+				fmt.Println("Headless captcha — skipping this account (solve on the visible lane).")
+			} else {
+				fmt.Println("Still waiting on captcha in the Chrome window…")
+				raiseLiveChromeWindow(liveChromeAccount)
+			}
+			_ = os.Stdout.Sync()
+		}
+		time.Sleep(800 * time.Millisecond)
+	}
+	if headlessChrome {
+		return fmt.Errorf("headless captcha — skipped")
+	}
+	return fmt.Errorf("waiting for captcha")
+}
+
+func clickRecaptchaCheckboxIfPresent(ctx context.Context) error {
+	var box map[string]float64
+	if err := chromedp.Evaluate(tumblrRecaptchaAnchorBoxJS, &box).Do(ctx); err != nil {
+		return err
+	}
+	if box == nil || box["w"] < 40 || box["h"] < 20 {
+		return fmt.Errorf("no recaptcha checkbox")
+	}
+	// Click left side of the widget (the checkbox), not the center (logo).
+	x := box["x"] + 28
+	y := box["y"] + box["h"]/2
+	fmt.Println("Clicking reCAPTCHA checkbox…")
+	_ = os.Stdout.Sync()
+	return chromedp.MouseClickXY(x, y).Do(ctx)
 }
 
 func recoverCannotPostLogin(ctx context.Context, creds Credentials, retry bool) error {
@@ -1388,7 +1546,7 @@ func nudgeTumblrLoginIfStuck() {
 	_ = autoFillTumblrLogin(creds)
 }
 
-var chromeDebugHTTPClient = &http.Client{Timeout: 15 * time.Second}
+var chromeDebugHTTPClient = &http.Client{Timeout: 3 * time.Second}
 
 func waitForDebugPort(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -1416,6 +1574,28 @@ func readDevToolsPort(dir string) string {
 		return ""
 	}
 	return line
+}
+
+// cookiesFromDebugPortTimed caps CDP/chromedp hangs so login/setup cannot stall forever.
+func cookiesFromDebugPortTimed(d time.Duration) ([]*network.Cookie, error) {
+	if d < 500*time.Millisecond {
+		d = 500 * time.Millisecond
+	}
+	type res struct {
+		c   []*network.Cookie
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		c, err := cookiesFromDebugPort()
+		ch <- res{c, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.c, r.err
+	case <-time.After(d):
+		return nil, fmt.Errorf("timed out after %s", d)
+	}
 }
 
 func cookiesFromDebugPort() ([]*network.Cookie, error) {
@@ -1976,6 +2156,66 @@ const chromeDeadAccountJS = `(() => {
 	if (!m) return '';
 	return t.slice(Math.max(0, m.index - 80), m.index + m[0].length + 80).replace(/\s+/g, ' ');
 })()`
+
+func freePhysicalMemoryMB() int {
+	if runtime.GOOS != "windows" {
+		return 99999
+	}
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		"(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory").Output()
+	if err != nil {
+		return 99999
+	}
+	kb, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || kb <= 0 {
+		return 99999
+	}
+	return kb / 1024
+}
+
+// waitForChromeMemoryHeadroom pauses before launch when free RAM is too low for
+// a Tumblr tab (otherwise Chrome Aw-Snaps with Out of Memory / 0xe0000008).
+func waitForChromeMemoryHeadroom(minFreeMB int, maxWait time.Duration) {
+	if minFreeMB <= 0 {
+		return
+	}
+	if maxWait < 5*time.Second {
+		maxWait = 5 * time.Second
+	}
+	deadline := time.Now().Add(maxWait)
+	warned := false
+	for {
+		free := freePhysicalMemoryMB()
+		if free >= minFreeMB {
+			if warned {
+				fmt.Printf("Memory OK — %d MB free, launching Chrome.\n", free)
+			}
+			return
+		}
+		if !warned {
+			fmt.Printf("Low RAM (%d MB free, need ~%d MB) — waiting so Chrome does not OOM. Close EA/game tabs if you can.\n", free, minFreeMB)
+			warned = true
+		}
+		if time.Now().After(deadline) {
+			fmt.Printf("Still only %d MB free after waiting — launching anyway.\n", free)
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func chromeOutOfMemoryPage() bool {
+	t, err := firstTumblrPageTarget()
+	if err != nil || t.ID == "" {
+		return false
+	}
+	var hit bool
+	_ = evalJSONOnChromeTarget(t, `(() => {
+		const b = ((document.body && document.body.innerText) || '') + ' ' + (document.title || '');
+		return /aw,? snap|out of memory|STATUS_BREAKPOINT|something went wrong while displaying/i.test(b);
+	})()`, &hit)
+	return hit
+}
 
 func errIfChromeTerminated() error {
 	if !onTumblrTerminatedPage() {
@@ -2861,12 +3101,12 @@ func detachLiveChrome() {
 
 func closeBotChrome() {
 	if liveChromeCtx != nil {
-		ctx, cancel := context.WithTimeout(liveChromeCtx, 3*time.Second)
+		// Short timeout — a dead CDP must not park the account batch.
+		ctx, cancel := context.WithTimeout(liveChromeCtx, 800*time.Millisecond)
 		_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 			return browser.Close().Do(ctx)
 		}))
 		cancel()
-		time.Sleep(400 * time.Millisecond)
 	}
 	detachLiveChrome()
 }

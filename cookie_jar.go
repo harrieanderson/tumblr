@@ -108,7 +108,7 @@ func (j *accountCookieJar) reseedFromAuthLocked() {
 	j.byName = parseCookieHeader(j.auth.Cookie)
 	j.byName["cl_pref"] = "show"
 	if strings.TrimSpace(j.byName["tz"]) == "" {
-		j.byName["tz"] = "Europe/London"
+		j.byName["tz"] = fingerprint().Timezone
 	}
 	j.auth.Cookie = j.headerLocked()
 }
@@ -175,7 +175,7 @@ func (j *accountCookieJar) applySetCookies(cookies []*http.Cookie) {
 	}
 	j.byName["cl_pref"] = "show"
 	if strings.TrimSpace(j.byName["tz"]) == "" {
-		j.byName["tz"] = "Europe/London"
+		j.byName["tz"] = fingerprint().Timezone
 	}
 	header := j.headerLocked()
 	if j.auth != nil {

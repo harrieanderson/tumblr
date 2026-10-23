@@ -1,0 +1,14 @@
+---
+description: Shared Agent Relay room — you, Codex CLI, and Cursor all see the same messages
+alwaysApply: true
+---
+
+# Agent Relay shared chat
+
+When collaborating via Agent Relay (or when the user mentions the shared room / Codex + Cursor together):
+
+1. Read the **active** transcript at `C:\Users\harri\Documents\AgentRelay\shared-chat.md` (JSON: `shared-chat.json`). Saved chats live in `Documents\AgentRelay\chats\` with an index at `chats-index.json`.
+2. Treat the active chat as the shared room — messages from You, Codex, and Cursor belong there. Older chats are history the user can switch back to in the relay UI.
+3. Do not assume browser localStorage is the source of truth; the relay server owns the transcript.
+4. If the user asks what Codex said or what was already discussed in the relay, answer from the active shared-chat file (or the relevant file under `chats\` if they name an older chat).
+5. Never print secrets (cookies, passwords, `sid`, API keys) into the shared room.

@@ -226,6 +226,11 @@ func main() {
 			setupProfileOnly = true
 		case "-skip-agekey":
 			skipSetupAgeKey = true
+		case "-setup-accounts":
+			if i+1 < len(args) {
+				setupProfileAccountsFile = strings.TrimSpace(args[i+1])
+				i++
+			}
 		case "-blog-look":
 			blogLookOnly = true
 		case "-fix-bio":
@@ -964,6 +969,7 @@ func main() {
 	fmt.Println("  -set-avatars   set profile pics from pics/profile_pic on every account")
 	fmt.Println("  -setup-profile English, birthday, AgeKey first, then pic/banner/colours/username")
 	fmt.Println("  -skip-agekey   with -setup-profile: leave AgeKey for manual verification")
+	fmt.Println("  -setup-accounts FILE  account id list for -setup-profile (use for parallel lanes)")
 	fmt.Println("  -blog-look     username + banner + purple/black theme on the first 20 logged-in blogs")
 	fmt.Println("  -fix-bio      strip #000000/#7C3AED leaked into blog descriptions")
 	fmt.Println("  -from N        start at account N (1-based) or ID; use with -setup-profile")
@@ -1256,9 +1262,47 @@ func isTransientNet(err error) bool {
 	return strings.Contains(s, "no such host") ||
 		strings.Contains(s, "temporary failure") ||
 		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "timeout exceeded") ||
+		strings.Contains(s, "client.timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
 		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "forcibly closed") ||
+		strings.Contains(s, "wsarecv") ||
+		strings.Contains(s, "wsasend") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "network is unreachable") ||
 		strings.Contains(s, "tls handshake") ||
-		strings.Contains(s, "unexpected eof")
+		strings.Contains(s, "unexpected eof") ||
+		strings.Contains(s, "eof")
+}
+
+// refreshCSRFWithRetry retries CSRF sync a few times so a proxy blip after a
+// successful Chrome login does not look like a dead session.
+func refreshCSRFWithRetry(client *http.Client, auth *Auth, attempts int) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = refreshCSRF(client, auth)
+		if err == nil {
+			return nil
+		}
+		if !isTransientNet(err) && !isCookieProblem(err) {
+			// Unknown failure — still worth a short retry once.
+			if i == 0 {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return err
+		}
+		if isCookieProblem(err) && !isTransientNet(err) {
+			return err
+		}
+		time.Sleep(time.Duration(2+i*2) * time.Second)
+	}
+	return err
 }
 
 func runOnePhoto(path, caption string) {

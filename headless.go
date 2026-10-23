@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
-	"regexp"
 )
 
 // headlessChrome hides every bot Chrome window. Captchas can't be solved while
@@ -35,27 +33,16 @@ func saveHeadlessPref(on bool) error {
 	return os.WriteFile(headlessPrefFile, append(raw, '\n'), 0o644)
 }
 
-var chromeVersionDirRe = regexp.MustCompile(`^(\d+)\.\d+\.\d+\.\d+$`)
-
 // Headless Chrome announces itself as "HeadlessChrome" in its user agent,
-// which Tumblr's login treats as a bot; send the normal desktop one instead.
-func headlessUserAgent(chrome string) string {
-	major := "140"
-	if entries, err := os.ReadDir(filepath.Dir(chrome)); err == nil {
-		for _, e := range entries {
-			if m := chromeVersionDirRe.FindStringSubmatch(e.Name()); e.IsDir() && m != nil {
-				major = m[1]
-			}
-		}
-	}
-	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36"
-}
-
+// which Tumblr's login treats as a bot; send the shared desktop fingerprint instead.
+// Lang is set by the Chrome launcher so visible and headless share one --lang.
 func headlessChromeArgs(chrome string) []string {
+	_ = chrome // path kept for call-site compatibility; version comes from fingerprint()
+	fp := fingerprint()
 	return []string{
 		"--headless=new",
-		"--window-size=1280,900",
+		fp.windowSizeArg(),
 		"--mute-audio",
-		"--user-agent=" + headlessUserAgent(chrome),
+		fp.userAgentArg(),
 	}
 }

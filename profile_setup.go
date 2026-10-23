@@ -125,6 +125,7 @@ var setupBlogName string
 var ageKeyHaveClicked bool
 var setupBirthdayApplied bool
 var setupAgeVerified bool
+var batchChromeClosed bool
 
 type setupLookStatus struct {
 	Title    string
@@ -156,6 +157,15 @@ type setupLookCheck struct {
 func (c setupLookCheck) essentialDone() bool {
 	// Banner is best-effort: some blogs never expose "Edit blog header image".
 	return c.TitleOK && c.BioOK && c.AvatarOK && c.UsernameOK && c.AccentOK && c.BackgroundOK
+}
+
+// batchReady is the ship-it bar for -skip-agekey runs: Zoey title + username,
+// plus at least one of avatar/banner. Don't burn minutes on bio/colour HTTP verify.
+func (c setupLookCheck) batchReady() bool {
+	if skipSetupAgeKey {
+		return c.TitleOK && c.UsernameOK && (c.AvatarOK || c.BannerOK)
+	}
+	return c.essentialDone()
 }
 
 func (c setupLookCheck) Done() bool {
@@ -613,16 +623,30 @@ func applySetupLook(cfg profileSetupConfig) {
 	}
 	if !usableBlogName(setupBlogName) {
 		setupSay("No @blog yet — opening blog settings to read the name.")
-		if _, err := openOrNavigateTab("https://www.tumblr.com/settings/blog"); err != nil {
-			setupSay("Blog settings: %s", err)
-		} else {
-			time.Sleep(2 * time.Second)
+		for _, dest := range []string{
+			"https://www.tumblr.com/settings/blog",
+			"https://www.tumblr.com/dashboard",
+			"https://www.tumblr.com/settings/account",
+		} {
+			if _, err := openOrNavigateTab(dest); err != nil {
+				continue
+			}
+			time.Sleep(800 * time.Millisecond)
+			if n := discoverBlogNameInChrome(); usableBlogName(n) {
+				setupBlogName = n
+				setupSay("Blog: %s", n)
+				break
+			}
 		}
-		if n := discoverBlogNameInChrome(); usableBlogName(n) {
-			setupBlogName = n
-			setupSay("Blog: %s", n)
-		} else if auth2, err := loadAuth(); err == nil {
-			setupBlogName = resolveSetupBlogName(auth2, "")
+		if !usableBlogName(setupBlogName) {
+			if auth2, err := loadAuth(); err == nil {
+				if n, err := syncAuthIdentity(newHumanClient(), &auth2); err == nil && usableBlogName(n) {
+					setupBlogName = n
+					setupSay("Blog from API: %s", n)
+				} else {
+					setupBlogName = resolveSetupBlogName(auth2, "")
+				}
+			}
 		}
 	}
 	pics, err := listProfilePics()
@@ -632,86 +656,61 @@ func applySetupLook(cfg profileSetupConfig) {
 	}
 	pic := picForCurrentAccount(pics)
 	if !usableBlogName(setupBlogName) {
-		setupSay("Still no @blog name after opening settings — cannot edit appearance yet.")
+		setupSay("Still no @blog name after settings — cannot edit appearance yet (will retry next pass).")
 		return
 	}
-	const lookTries = 3
+	// One outer pass: avatar here, banner once in applyBlogLookParts.
 	var check setupLookCheck
-	// The avatar and banner editors either work first time or Tumblr is
-	// blocking them (explicit-flagged blogs, hidden header editor); redoing
-	// them on every retry only burns minutes per account.
-	avatarTries, themeTries := 0, 0
-	for try := 1; try <= lookTries; try++ {
-		if try == 1 {
-			setupSay("Leaving dashboard — opening blog settings")
-		} else {
-			setupSay("Look not set yet (%s) — retrying %d/%d", check.report(), try, lookTries)
-		}
-		name, ok := openVerifiedBlogSettings(setupBlogName)
-		if !ok {
-			setupSay("Could not open blog settings for this account — skipping the look step.")
-			return
-		}
-		setupBlogName = name
-		if try == 1 {
-			check = refreshSetupLookCheck(setupBlogName, cfg)
-			if check.Done() {
-				setupSay("Look already set (%s) — skipping appearance edits.", check.report())
-				openFinishedBlogSettings(setupBlogName)
-				return
+	setupSay("Leaving dashboard — opening blog settings")
+	name, ok := openVerifiedBlogSettings(setupBlogName)
+	if !ok {
+		setupSay("Could not open blog settings for this account — skipping the look step.")
+		return
+	}
+	setupBlogName = name
+	check = refreshSetupLookCheck(setupBlogName, cfg)
+	if check.Done() {
+		setupSay("Look already set (%s) — skipping appearance edits.", check.report())
+		return
+	}
+	// Already Zoey-named with title+avatar: still push banner once if missing.
+	needAvatar := !check.TitleOK || !check.BioOK || !check.AvatarOK
+	needTheme := !check.BannerOK || !check.AccentOK || !check.BackgroundOK
+	needUser := !check.UsernameOK
+	setupSay("Look needs work: %s", check.report())
+	if needAvatar {
+		setupSay("Opening profile appearance for @%s", setupBlogName)
+		if err := applyBlogLookInChrome(pic, setupBlogName, cfg.Title, cfg.Description); err != nil {
+			setupSay("Avatar/title/bio: %s", err)
+			if err2 := applyBlogLookOnPort(liveDebugPort); err2 != nil {
+				setupSay("Avatar fallback: %s", err2)
 			}
-			setupSay("Look needs work: %s", check.report())
-		}
-		needAvatar := ((!check.TitleOK || !check.BioOK) && avatarTries < 2) || (!check.AvatarOK && avatarTries < 1)
-		needTheme := (!check.BannerOK || !check.AccentOK || !check.BackgroundOK) && themeTries < 1
-		needUser := !check.UsernameOK
-		if !needAvatar && !needTheme && !needUser {
-			break
-		}
-		if needAvatar {
-			avatarTries++
-			setupSay("Opening profile appearance for @%s", setupBlogName)
-			if err := applyBlogLookInChrome(pic, setupBlogName, cfg.Title, cfg.Description); err != nil {
-				setupSay("Avatar/title/bio: %s", err)
-				if err2 := applyBlogLookOnPort(liveDebugPort); err2 != nil {
-					setupSay("Avatar fallback: %s", err2)
-				}
-			}
-		}
-		if needTheme || needUser {
-			if needTheme {
-				themeTries++
-			}
-			if err := applyBlogLookParts(setupBlogName, cfg, needTheme); err != nil {
-				setupSay("Blog look: %s", err)
-			}
-		}
-		if n := discoverBlogNameInChrome(); usableBlogName(n) {
-			setupBlogName = n
-		}
-		time.Sleep(2 * time.Second)
-		check = refreshSetupLookCheck(setupBlogName, cfg)
-		setupSay("Look check: %s", check.report())
-		if check.Done() {
-			setupSay("Look confirmed: profile pic, banner, title, bio, and username are set.")
-			openFinishedBlogSettings(setupBlogName)
-			return
-		}
-		if check.essentialDone() {
-			setupSay("Look confirmed (no banner on this blog — Tumblr hid the header editor): %s", check.report())
-			openFinishedBlogSettings(setupBlogName)
-			return
-		}
-		// Only banner missing: don't burn the remaining retries on a header
-		// editor Tumblr never shows for this account.
-		if check.TitleOK && check.BioOK && check.AvatarOK && check.UsernameOK &&
-			check.AccentOK && check.BackgroundOK && !check.BannerOK {
-			setupSay("Banner unavailable on this blog — continuing.")
-			openFinishedBlogSettings(setupBlogName)
-			return
 		}
 	}
-	setupSay("Look still incomplete after retries (%s).", check.report())
+	if needTheme || needUser {
+		if err := applyBlogLookParts(setupBlogName, cfg, needTheme); err != nil {
+			setupSay("Blog look: %s", err)
+		}
+	}
+	if n := discoverBlogNameInChrome(); usableBlogName(n) {
+		setupBlogName = n
+	}
+	time.Sleep(400 * time.Millisecond)
+	check = refreshSetupLookCheck(setupBlogName, cfg)
+	setupSay("Look check: %s", check.report())
+	if check.Done() {
+		setupSay("Look confirmed: profile pic, banner, title, bio, and username are set.")
+		return
+	}
+	if check.essentialDone() || check.batchReady() {
+		setupSay("Look good enough for batch (%s) — next account.", check.report())
+		return
+	}
+	if check.TitleOK && check.UsernameOK {
+		setupSay("Core look set; banner/colours still incomplete (%s) — moving on.", check.report())
+		return
+	}
+	setupSay("Look still incomplete (%s) — moving on.", check.report())
 }
 
 func openFinishedBlogSettings(blog string) {
@@ -734,10 +733,10 @@ func openFinishedBlogSettings(blog string) {
 		return
 	}
 	focusChromeTarget(t)
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	dismissOverlaysOnPort()
 	if err := applyAnyoneCanMessageOnTarget(t); err != nil {
-		setupSay("Open DMs: %s", err)
+		setupSay("Open DMs: %s (continuing)", err)
 	}
 }
 
@@ -809,36 +808,27 @@ func applyAnyoneCanMessageOnTarget(t chromeJSONTarget) error {
 		return fmt.Errorf("no tab")
 	}
 	var result string
-	for attempt := 0; attempt < 4; attempt++ {
-		dismissOverlaysOnPort()
-		if err := evalJSONOnChromeTarget(t, chromeSetAnyoneCanMessageJS, &result); err != nil {
-			return err
-		}
-		setupSay("Open DMs (anyone can message): %s", result)
-		if result == "already-off" || result == "off" {
-			return nil
-		}
-		if result == "missing" {
-			// Messaging section sits lower on /settings/blog/{name} — scroll and retry.
-			_ = evalJSONOnChromeTarget(t, `(() => {
-				const nodes = [...document.querySelectorAll('h1,h2,h3,h4,legend,div,span,p,strong')];
-				const hit = nodes.find(el => /messaging/i.test((el.innerText||el.textContent||'').trim()) && (el.innerText||'').trim().length < 40);
-				if (hit) { hit.scrollIntoView({block:'center'}); return 'messaging'; }
-				window.scrollBy(0, Math.min(900, document.body.scrollHeight));
-				return 'scrolled';
-			})()`, &result)
-			time.Sleep(800 * time.Millisecond)
-			continue
-		}
-		time.Sleep(900 * time.Millisecond)
+	// One scroll + one click — never stall the batch on this toggle.
+	_ = evalJSONOnChromeTarget(t, `(() => {
+		const nodes = [...document.querySelectorAll('h1,h2,h3,h4,legend,div,span,p,strong')];
+		const hit = nodes.find(el => /messaging|who can message/i.test((el.innerText||el.textContent||'').trim()) && (el.innerText||'').trim().length < 48);
+		if (hit) { hit.scrollIntoView({block:'center'}); return 'messaging'; }
+		window.scrollBy(0, Math.min(1200, document.body.scrollHeight));
+		return 'scrolled';
+	})()`, &result)
+	time.Sleep(250 * time.Millisecond)
+	dismissOverlaysOnPort()
+	if err := evalJSONOnChromeTarget(t, chromeSetAnyoneCanMessageJS, &result); err != nil {
+		return err
+	}
+	setupSay("Open DMs (anyone can message): %s", result)
+	if result == "already-off" || result == "off" {
+		return nil
 	}
 	if result == "missing" {
 		return fmt.Errorf("messaging toggle not found")
 	}
-	if result != "already-off" && result != "off" {
-		return fmt.Errorf("%s", result)
-	}
-	return nil
+	return fmt.Errorf("%s", result)
 }
 
 func refreshSetupLookCheck(blog string, cfg profileSetupConfig) setupLookCheck {
@@ -846,7 +836,7 @@ func refreshSetupLookCheck(blog string, cfg profileSetupConfig) setupLookCheck {
 		if _, err := openOrNavigateTab("https://www.tumblr.com/settings/blog/" + blog); err != nil {
 			setupSay("Look check page: %s", err)
 		} else {
-			time.Sleep(1500 * time.Millisecond)
+			time.Sleep(400 * time.Millisecond)
 		}
 	}
 	return readSetupLookCheck(blog, cfg)
@@ -875,10 +865,12 @@ func readSetupLookCheck(blog string, cfg profileSetupConfig) setupLookCheck {
 			c.UsernameOK = true
 		}
 	}
-	if auth, err := loadAuth(); err == nil {
-		if p, err := fetchBlogProfile(newHumanClient(), auth, blog); err == nil {
-			st := savedThemeStatus(p, cfg)
-			c.AccentOK, c.BackgroundOK, c.BannerOK = st.AccentOK, st.BackgroundOK, st.BannerOK
+	if !skipSetupAgeKey {
+		if auth, err := loadAuth(); err == nil {
+			if p, err := fetchBlogProfile(newHumanClient(), auth, blog); err == nil {
+				st := savedThemeStatus(p, cfg)
+				c.AccentOK, c.BackgroundOK, c.BannerOK = st.AccentOK, st.BackgroundOK, st.BannerOK
+			}
 		}
 	}
 	return c
@@ -918,7 +910,7 @@ func openVerifiedBlogSettings(name string) (string, bool) {
 		}
 		t = leaveCustomizeTheme(t, name)
 		landed := ""
-		deadline := time.Now().Add(8 * time.Second)
+		deadline := time.Now().Add(3 * time.Second)
 		for {
 			if landed = blogNameFromURL(t.URL); landed != "" {
 				break
@@ -926,7 +918,7 @@ func openVerifiedBlogSettings(name string) (string, bool) {
 			if time.Now().After(deadline) {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			if list, err := listChromeTargets(); err == nil {
 				for _, x := range list {
 					if x.ID == t.ID {
@@ -983,7 +975,8 @@ func runSetupProfile() error {
 	setupAgeVerified = false
 	setupSay("Using %s — if this line is missing, the GUI you clicked is an old process. Ctrl+C and run: go run . -gui", setupCodeStamp)
 	setupSay("Logging in, then account settings first (English, birthday, AgeKey), then appearance.")
-	cmd, err := startChromeLoggedInOpts(&auth, false, true)
+	// visible only when headless is off — Harrie can game while setup runs.
+	cmd, err := startChromeLoggedInOpts(&auth, false, !headlessChrome)
 	if err != nil {
 		return err
 	}
@@ -992,10 +985,28 @@ func runSetupProfile() error {
 	}
 	_ = cmd
 	setupSay("Chrome stays open for setup.")
+	batchChromeClosed = false
 	defer func() {
 		if skipSetupAgeKey {
+			if batchChromeClosed {
+				return
+			}
 			setupSay("Closing Chrome so the next account can start (AgeKey left for you to do manually).")
-			stopChrome(cmd)
+			id := strings.TrimSpace(liveChromeAccount)
+			if id == "" {
+				if acc, ok := currentAccount(); ok {
+					id = acc.ID
+				}
+			}
+			dir := ""
+			if id != "" {
+				dir, _ = chromeDirForAccount(id)
+			}
+			stopChromeOpts(cmd, false)
+			if dir != "" {
+				killChromeWithUserDataDir(dir)
+			}
+			killBotDebugChromes()
 			return
 		}
 		setupSay("Chrome stays open so you can check the profile. Close the window when you're done.")
@@ -1009,21 +1020,16 @@ func runSetupProfile() error {
 		}
 	}()
 
-	name := ""
-	if strings.TrimSpace(auth.Cookie) != "" {
-		n, err := syncAuthIdentity(newHumanClient(), &auth)
-		if err != nil || !usableBlogName(n) {
-			maybeFillBlog(newHumanClient(), &auth)
-			name = resolveSetupBlogName(auth, n)
-		} else {
-			name = n
+	// No proxy/API here — that was parking on the dashboard for minutes.
+	// Blog name comes from Chrome (or saved auth); setup itself is CDP-only.
+	setupBlogName = resolveSetupBlogName(auth, "")
+	if !usableBlogName(setupBlogName) {
+		if n := discoverBlogNameInChrome(); usableBlogName(n) {
+			setupBlogName = n
 		}
-	} else {
-		name = resolveSetupBlogName(auth, "")
 	}
-	setupBlogName = name
-	if usableBlogName(name) {
-		setupSay("Blog: %s", name)
+	if usableBlogName(setupBlogName) {
+		setupSay("Blog: %s", setupBlogName)
 	} else {
 		setupSay("Could not detect @blog yet — still running account settings, then look.")
 	}
@@ -1034,65 +1040,152 @@ func runSetupProfile() error {
 		recoverSetupLogin()
 	}
 	dismissOverlaysOnPort()
-	if !usableBlogName(setupBlogName) {
-		if n := discoverBlogNameInChrome(); usableBlogName(n) {
-			setupBlogName = n
-			setupSay("Blog: %s", n)
-		}
-	}
 
-	setupSay("1/5 English language")
 	if _, err := waitForAccountSettingsPage(); err != nil {
 		setupSay("Settings page: %s", err)
 	}
-	if err := applyEnglishOnPort(); err != nil {
-		setupSay("Language: %s", err)
-	}
-
-	setupSay("2/5 Birthday (29 Dec 2000)")
-	if err := applyBirthdayOnSettings(); err != nil {
-		setupSay("Birthday: %s", err)
-		setupSay("In Chrome, open Settings → set birthday 29 Dec 2000.")
-	} else {
+	st0 := readSetupPageStatus()
+	en0 := englishAlreadyOnSettings()
+	mt0 := readMatureToggleStatus()
+	bdayOK := sessionBirthdayOK(st0)
+	ageOK := sessionAgeOK(st0)
+	matureOK := mt0.On
+	if en0 && bdayOK && (skipSetupAgeKey || (ageOK && matureOK)) {
+		if skipSetupAgeKey {
+			setupSay("Account settings already Zoey-ready (English + birthday) — skipping straight to appearance.")
+		} else {
+			setupSay("Account settings already Zoey-ready (English + birthday + AgeKey/mature) — skipping straight to appearance.")
+		}
 		setupBirthdayApplied = true
-	}
-
-	if skipSetupAgeKey {
-		setupSay("3/5 Age verification skipped — do AgeKey manually later.")
-	} else {
-		setupSay("3/5 Age verification (AgeKey). Type the passcode in Windows Security if it appears.")
-		if err := applyAgeKeyInChrome(); err != nil {
-			setupSay("AgeKey: %s", err)
-		} else if st := readSetupPageStatus(); st.Verified {
+		if ageOK {
 			setupAgeVerified = true
 		}
-		if err := waitUntilAgeVerified(); err != nil {
-			setupSay("AgeKey wait: %s", err)
+	} else {
+		setupSay("1/5 English language")
+		if en0 {
+			setupSay("Language already English — skipping.")
+		} else if err := applyEnglishOnPort(); err != nil {
+			setupSay("Language: %s", err)
 		}
-		if setupSkipped {
-			setupSay("AgeKey skipped from GUI — still doing mature + appearance on this account.")
-			setupSkipped = false
+
+		setupSay("2/5 Birthday (29 Dec 2000)")
+		if bdayOK {
+			setupSay("Birthday already set — skipping.")
+			setupBirthdayApplied = true
+		} else {
+			var berr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				if attempt > 1 {
+					setupSay("Birthday retry %d/3 — reopening account settings.", attempt)
+					_, _ = waitForAccountSettingsPage()
+				}
+				berr = applyBirthdayOnSettings()
+				if berr == nil {
+					setupBirthdayApplied = true
+					break
+				}
+				setupSay("Birthday: %s", berr)
+				time.Sleep(500 * time.Millisecond)
+			}
+			if !setupBirthdayApplied {
+				if st := readSetupPageStatus(); sessionBirthdayOK(st) {
+					setupSay("Birthday shows set/locked on page — continuing.")
+					setupBirthdayApplied = true
+				} else {
+					setupSay("Birthday still not saved after retries — staying on settings before appearance.")
+					setupSay("In Chrome, open Settings → set birthday 29 Dec 2000 if the fields are visible.")
+				}
+			}
 		}
-		setupSay("AgeKey finished — waiting until Tumblr unlocks Show mature content.")
-		if err := waitForMatureContentReady(); err != nil {
-			setupSay("Mature unlock wait: %s", err)
+
+		if skipSetupAgeKey {
+			setupSay("3/5 Age verification skipped — do AgeKey manually later.")
+		} else if ageOK {
+			setupSay("3/5 Age already verified — skipping AgeKey.")
+			setupAgeVerified = true
+		} else {
+			setupSay("3/5 Age verification (AgeKey). Type the passcode in Windows Security if it appears.")
+			if err := applyAgeKeyInChrome(); err != nil {
+				setupSay("AgeKey: %s", err)
+			} else if st := readSetupPageStatus(); st.Verified {
+				setupAgeVerified = true
+			}
+			if err := waitUntilAgeVerified(); err != nil {
+				setupSay("AgeKey wait: %s", err)
+			}
+			if setupSkipped {
+				setupSay("AgeKey skipped from GUI — still doing mature + appearance on this account.")
+				setupSkipped = false
+			}
+			setupSay("AgeKey finished — waiting until Tumblr unlocks Show mature content.")
+			if err := waitForMatureContentReady(); err != nil {
+				setupSay("Mature unlock wait: %s", err)
+			}
+		}
+
+		if skipSetupAgeKey {
+			setupSay("4/5 Mature content skipped (needs AgeKey) — appearance next.")
+		} else {
+			setupSay("4/5 Show mature content, do not blur mature content")
+			if matureOK {
+				setupSay("Mature content already on — skipping.")
+			} else if err := applyMatureContentInChrome(); err != nil {
+				setupSay("Mature content: %s", err)
+			}
 		}
 	}
 
-	setupSay("4/5 Show mature content, do not blur mature content")
-	if err := applyMatureContentInChrome(); err != nil {
-		setupSay("Mature content: %s", err)
+	// Birthday/settings can leave us without a resolved @blog — pull it before appearance.
+	if !usableBlogName(setupBlogName) {
+		if n := discoverBlogNameInChrome(); usableBlogName(n) {
+			setupBlogName = n
+		}
+	}
+	if !usableBlogName(setupBlogName) {
+		if auth2, err := loadAuth(); err == nil {
+			if n, err := syncAuthIdentity(newHumanClient(), &auth2); err == nil && usableBlogName(n) {
+				setupBlogName = n
+				setupSay("Blog from session: %s", n)
+			}
+		}
+	}
+	if usableBlogName(setupBlogName) {
+		setupSay("Blog: %s", setupBlogName)
 	}
 
 	setupSay("5/5 Profile picture, banner, colours, username")
 	applySetupLook(cfg)
 
-	if cookies, err := cookiesFromDebugPort(); err == nil && cookieValue(cookies, "sid") != "" {
+	// -skip-agekey batch: kill Chrome NOW. Cookie/CDP sync after look is what
+	// left Tumblr sitting on the finished page for minutes.
+	if skipSetupAgeKey {
+		setupSay("Account batch step done — closing Chrome and moving on.")
+		id := strings.TrimSpace(liveChromeAccount)
+		if id == "" {
+			if acc, ok := currentAccount(); ok {
+				id = acc.ID
+			}
+		}
+		dir := ""
+		if id != "" {
+			dir, _ = chromeDirForAccount(id)
+		}
+		stopChromeOpts(cmd, false)
+		if dir != "" {
+			killChromeWithUserDataDir(dir)
+		}
+		killBotDebugChromes()
+		batchChromeClosed = true
+		return nil
+	}
+
+	if cookies, err := cookiesFromDebugPortTimed(2 * time.Second); err == nil && cookieValue(cookies, "sid") != "" {
 		auth.Cookie = buildTumblrCookieHeader(cookies)
 		persistMaturePref(&auth)
 		setupSay("Saved session cookies.")
+	} else if err != nil {
+		setupSay("Cookie sync: %s", err)
 	}
-	// Always land on /settings/blog/{name} and turn OFF follower-only DMs.
 	if usableBlogName(setupBlogName) {
 		openFinishedBlogSettings(setupBlogName)
 	}
@@ -1277,6 +1370,17 @@ const chromeDismissOverlaysJS = `(() => {
 		const ctx = ctxOf(b) + ' ' + t;
 		if (/agekey|verify your age|create my agekey|use your selfie|windows security|tumblr premium|get premium now|blaze/i.test(ctx)) continue;
 		if (cookieish(ctx)) { b.click(); return t; }
+	}
+	// First-run tooltips ("you'll find all your communities here", etc.)
+	for (const el of document.querySelectorAll('button, [role="button"], [aria-label]')) {
+		if (!vis(el)) continue;
+		const lab = (el.getAttribute('aria-label') || textOf(el)).replace(/\s+/g, ' ').trim();
+		if (!/^(close|cerrar|dismiss|×|x)$/i.test(lab)) continue;
+		const ctx = ctxOf(el);
+		if (/comunidades|communities|encontraras|encontrarás|radar|verification email|magic link/i.test(ctx)) {
+			el.click();
+			return 'tooltip-close';
+		}
 	}
 	for (const b of buttons) {
 		const t = textOf(b);
@@ -1787,9 +1891,12 @@ func chromeSetBirthdayFieldsJS(year, month, day int) string {
 		const yearEl = byAria(/year|год|año|année|jahr/i);
 		let got = [];
 		if (monthEl) {
+			const nums = [...monthEl.options].map(o => Number(String(o.value || '').replace(/^0+/, ''))).filter(n => !Number.isNaN(n));
+			const zeroIdx = nums.includes(0) && Math.max(...nums) <= 11;
+			const target = zeroIdx ? wantM - 1 : wantM;
 			const opt = [...monthEl.options].find(o => {
-				const v = String(o.value || '').replace(/^0+/, '');
-				if (Number(v) === wantM) return true;
+				const v = Number(String(o.value || '').replace(/^0+/, ''));
+				if (v === target || v === wantM) return true;
 				const t = (o.text || '').replace(/\s+/g, ' ').trim();
 				return monthName && monthName.test(t);
 			});
@@ -1856,9 +1963,12 @@ func chromeSetBirthdayAsyncJS(year, month, day int) string {
 		const dayEl = byAria(/^(day|день|día|jour|tag)$/i) || byAria(/day|день/i);
 		const yearEl = byAria(/year|год|año|année|jahr/i);
 		if (monthEl) {
+			const nums = [...monthEl.options].map(o => Number(String(o.value || '').replace(/^0+/, ''))).filter(n => !Number.isNaN(n));
+			const zeroIdx = nums.includes(0) && Math.max(...nums) <= 11;
+			const target = zeroIdx ? wantM - 1 : wantM;
 			const opt = [...monthEl.options].find(o => {
-				const v = String(o.value || '').replace(/^0+/, '');
-				if (Number(v) === wantM) return true;
+				const v = Number(String(o.value || '').replace(/^0+/, ''));
+				if (v === target || v === wantM) return true;
 				const t = (o.text || '').replace(/\s+/g, ' ').trim();
 				return monthName && monthName.test(t);
 			});
@@ -2224,40 +2334,39 @@ func dismissOverlaysOnPort() {
 	if ageKeyHandsOff() {
 		return
 	}
-	for i := 0; i < 8; i++ {
-		if nag := dismissChromeLeakDialog(); nagWasDismissed(nag) {
-			fmt.Println("Dismissed:", nag)
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		if nag := dismissSavePasswordBubble(); nagWasDismissed(nag) {
-			fmt.Println("Dismissed:", nag)
-			time.Sleep(250 * time.Millisecond)
-			continue
-		}
-		if hit := dismissPremiumOnPort(); hit != "" {
-			fmt.Println("Dismissed:", hit)
-			time.Sleep(350 * time.Millisecond)
-			continue
-		}
+	// Prefer fast CDP dismissals. Native UIA walks are capped and only tried once.
+	for i := 0; i < 4; i++ {
 		var overlay string
 		if err := evalOnTumblrPage(chromeDismissOverlaysJS, &overlay); err == nil && overlay != "" {
 			fmt.Println("Dismissed:", overlay)
-			time.Sleep(350 * time.Millisecond)
+			time.Sleep(120 * time.Millisecond)
 			continue
 		}
 		if err := evalOnTumblrPage(chromeClickCookieJS, &overlay); err == nil && overlay != "" {
 			fmt.Println("Dismissed cookies:", overlay)
-			time.Sleep(350 * time.Millisecond)
+			time.Sleep(120 * time.Millisecond)
 			continue
+		}
+		if hit := dismissPremiumOnPort(); hit != "" {
+			fmt.Println("Dismissed:", hit)
+			time.Sleep(120 * time.Millisecond)
+			continue
+		}
+		if i == 0 {
+			if nag := dismissChromeLeakDialog(); nagWasDismissed(nag) {
+				fmt.Println("Dismissed:", nag)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			if nag := dismissSavePasswordBubble(); nagWasDismissed(nag) {
+				fmt.Println("Dismissed:", nag)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 		}
 		if hit := clickCookieAcceptOnConsentTargets(); hit != "" {
 			fmt.Println("Dismissed cookies:", hit)
-			time.Sleep(400 * time.Millisecond)
-			continue
-		}
-		if cookieBannerOpen() {
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(120 * time.Millisecond)
 			continue
 		}
 		return
@@ -2586,21 +2695,9 @@ func chromedpNavigateLoggedIn(ctx context.Context, pageURL string) error {
 
 func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 	if look := lookStatusFromAPI(blogName); look.Complete() {
-		fmt.Println("Name, bio, and avatar already set — still opening appearance for banner and save.")
+		fmt.Println("Name, bio, and avatar already set — still opening appearance to save.")
 	}
-
-	headerAbs := ""
-	if banners, err := listBannerPics(); err != nil {
-		fmt.Println("Banner:", err)
-	} else if p := bannerForCurrentAccount(banners); p != "" {
-		abs, err := imageFromDir(p, backgroundPicsDir, "banner")
-		if err != nil {
-			fmt.Println("Banner:", err)
-		} else {
-			headerAbs = abs
-			fmt.Println("Banner:", filepath.ToSlash(p))
-		}
-	}
+	// Banner is applied once in applyBlogLookParts — never here (was double-setting).
 
 	ctx, cancel, err := withBotChrome(120 * time.Second)
 	if err != nil {
@@ -2615,7 +2712,7 @@ func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 		return err
 	}
 
-	var href, clicked, filled, saved string
+	var href, clicked, filled string
 	err = chromedp.Run(ctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			return chromedpNavigateLoggedIn(ctx, settings)
@@ -2691,22 +2788,10 @@ func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 	if err := setLookImageOnTarget(t, chromeAvatarBoxJS, avatarAbs, "Edit blog avatar image"); err != nil {
 		fmt.Println("Avatar:", err)
 	} else if hit := confirmAvatarAndSaveOnTarget(t); hit != "" {
-		saved = hit
 		fmt.Println("Clicked:", hit)
 	}
-	if headerAbs != "" {
-		if err := trySetHeaderFileOnTarget(t, headerAbs); err != nil {
-			fmt.Println("Banner:", err)
-		} else if hit := confirmAvatarAndSaveOnTarget(t); hit != "" {
-			if saved != "" {
-				saved += " | "
-			}
-			saved += hit
-			fmt.Println("Clicked:", hit)
-		}
-	}
 
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
 	look := lookStatusFromAPI(blogName)
 	switch {
 	case look.Complete():
@@ -3395,18 +3480,22 @@ func applyMatureContentOnPort(port string) error {
 		"https://www.tumblr.com/settings/account",
 		"https://www.tumblr.com/settings/dashboard",
 	}
+	maxAttempts := 6
+	if skipSetupAgeKey {
+		// Without AgeKey the toggles are often locked — don't burn 15s+ retrying.
+		maxAttempts = 1
+		pages = []string{"https://www.tumblr.com/settings/account"}
+	}
 	var result string
-	for attempt := 0; attempt < 6; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		for _, page := range pages {
 			t, err := openOrNavigateTab(page)
 			if err != nil {
 				continue
 			}
 			focusChromeTarget(t)
-			time.Sleep(900 * time.Millisecond)
 			var dismiss string
 			_ = evalJSONOnChromeTarget(t, chromeDismissOverlaysJS, &dismiss)
-			time.Sleep(250 * time.Millisecond)
 			mt := matureToggleStatus{}
 			_ = evalJSONOnChromeTarget(t, chromeMatureToggleStatusJS, &mt)
 			if mt.State == "missing" || mt.State == "disabled" {
@@ -3422,9 +3511,8 @@ func applyMatureContentOnPort(port string) error {
 			if matureShowSucceeded(result) {
 				break
 			}
-			// Click registered but toggle did not stick — wait and retry.
 			if strings.Contains(result, "show:clicked") {
-				time.Sleep(1200 * time.Millisecond)
+				time.Sleep(400 * time.Millisecond)
 				_ = evalJSONOnChromeTarget(t, chromeMatureToggleStatusJS, &mt)
 				if mt.State == "ready" && mt.On {
 					result = "show:on"
@@ -3439,7 +3527,10 @@ func applyMatureContentOnPort(port string) error {
 		if attempt >= 1 && (strings.Contains(result, "missing") || strings.Contains(result, "disabled")) {
 			break
 		}
-		time.Sleep(1500 * time.Millisecond)
+		if skipSetupAgeKey {
+			break
+		}
+		time.Sleep(600 * time.Millisecond)
 	}
 	if !matureShowSucceeded(result) {
 		if strings.Contains(result, "show:missing") || strings.Contains(result, "show:disabled") || result == "" {
@@ -3592,6 +3683,47 @@ func finishAccountSettings() error {
 	return nil
 }
 
+const chromeEnglishAlreadyJS = `(() => {
+	const vis = (el) => {
+		if (!el || !el.getBoundingClientRect) return false;
+		const r = el.getBoundingClientRect();
+		const s = getComputedStyle(el);
+		return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+	};
+	const textOf = (el) => (el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+	const isLangSelect = (sel) => {
+		const blob = [...sel.options].map(o => (o.value + ' ' + o.text).toLowerCase()).join(' | ');
+		return /english|\ben\b|en_us|en-us/.test(blob) && /deutsch|français|francais|español|espanol|italiano|日本語/.test(blob);
+	};
+	const englishOpt = (sel) => [...sel.options].find(o => {
+		const v = (o.value || '').toLowerCase();
+		const t = (o.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+		return t === 'english' || t === 'inglés' || t === 'ingles' || v === 'en' || v === 'en_us' || v === 'en-us' || v.startsWith('en_') || v.startsWith('en-');
+	});
+	for (const sel of document.querySelectorAll('select')) {
+		if (!isLangSelect(sel)) continue;
+		const opt = englishOpt(sel);
+		if (opt && sel.value === opt.value) return true;
+	}
+	return [...document.querySelectorAll('button, [role="combobox"], select')].some(el =>
+		vis(el) && /^english$/i.test(textOf(el)) && !(el.closest && el.closest('.skiptranslate, [class*="goog-te"]')));
+})()`
+
+func englishAlreadyOnSettings() bool {
+	t, ok := tumblrSettingsAccountTarget()
+	if !ok {
+		t, ok = tumblrPageTarget()
+	}
+	if !ok {
+		return false
+	}
+	var already bool
+	if err := evalJSONOnChromeTarget(t, chromeEnglishAlreadyJS, &already); err != nil {
+		return false
+	}
+	return already
+}
+
 func applyEnglishOnPort() error {
 	t, ok := tumblrSettingsAccountTarget()
 	if !ok || !strings.Contains(t.URL, "/settings/account") {
@@ -3600,18 +3732,13 @@ func applyEnglishOnPort() error {
 			return err
 		}
 		t = opened
-		time.Sleep(1200 * time.Millisecond)
 	}
 	focusChromeTarget(t)
-	dismissOverlaysOnPort()
 	var out string
 	if err := evalPromiseOnChromeTarget(t, chromeSetEnglishJS, &out); err != nil {
 		return err
 	}
 	setupSay("Language: %s", out)
-	if strings.Contains(out, "saved") || strings.Contains(out, "english") {
-		time.Sleep(1200 * time.Millisecond)
-	}
 	return nil
 }
 
@@ -3621,41 +3748,39 @@ func waitForAccountSettingsPage() (chromeJSONTarget, error) {
 		return t, err
 	}
 	focusChromeTarget(t)
-	deadline := time.Now().Add(25 * time.Second)
+	dismissOverlaysOnPort()
+	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
-		if nag := dismissSavePasswordBubble(); nagWasDismissed(nag) {
-			fmt.Println("Dismissed:", nag)
-		}
 		if onTumblrLoginPage() {
 			recoverSetupLogin()
 			if nt, ok := tumblrSettingsAccountTarget(); ok {
 				t = nt
 			}
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(150 * time.Millisecond)
 			continue
 		}
-		var text string
-		_ = evalJSONOnChromeTarget(t, `(() => (document.body && document.body.innerText || '').slice(0, 4000))()`, &text)
-		if looksLikeTumblrLoginPage(t.URL, text) {
-			recoverSetupLogin()
-			time.Sleep(500 * time.Millisecond)
-			if nt, ok := tumblrSettingsAccountTarget(); ok {
-				t = nt
-			}
-			continue
-		}
-		low := strings.ToLower(text)
-		if strings.Contains(low, "birthday") || strings.Contains(low, "language") || strings.Contains(low, "fecha de nacimiento") || strings.Contains(low, "anniversaire") || (strings.Contains(low, "age group") && strings.Contains(low, "account")) {
-			time.Sleep(600 * time.Millisecond)
+		var ready bool
+		_ = evalJSONOnChromeTarget(t, `(() => {
+			const href = (location.href || '').toLowerCase();
+			if (!href.includes('/settings/account')) return false;
+			const t = ((document.body && document.body.innerText) || '').toLowerCase();
+			if (/birthday|language|fecha de nacimiento|anniversaire|idioma|age group/.test(t)) return true;
+			return !!document.querySelector('select, input, button');
+		})()`, &ready)
+		if ready {
 			if nt, ok := tumblrSettingsAccountTarget(); ok {
 				return nt, nil
 			}
 			return t, nil
 		}
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		if nt, ok := tumblrSettingsAccountTarget(); ok {
 			t = nt
 		}
+	}
+	// Act anyway — English/birthday JS retries if controls aren't ready.
+	if strings.Contains(strings.ToLower(t.URL), "/settings/account") {
+		return t, nil
 	}
 	return t, fmt.Errorf("settings page did not finish loading")
 }
@@ -3670,12 +3795,14 @@ func applyBirthdayOnSettings() error {
 		}
 	}
 	focusChromeTarget(t)
-	dismissOverlaysOnPort()
 	return applyBirthdayOnPort(t)
 }
 
 func applyBirthdayOnPort(t chromeJSONTarget) error {
 	cfg := loadProfileSetupConfig()
+	focusChromeTarget(t)
+	dismissOverlaysOnPort()
+
 	var out string
 	if err := evalPromiseOnChromeTarget(t, chromeSetBirthdayAsyncJS(cfg.BirthdayYear, cfg.BirthdayMonth, cfg.BirthdayDay), &out); err != nil {
 		if err2 := evalJSONOnChromeTarget(t, chromeSetBirthdayFieldsJS(cfg.BirthdayYear, cfg.BirthdayMonth, cfg.BirthdayDay), &out); err2 != nil {
@@ -3687,54 +3814,94 @@ func applyBirthdayOnPort(t chromeJSONTarget) error {
 		setupSay("Birthday dropdowns are disabled — Tumblr already locked the date.")
 		return nil
 	}
-	if out == "" || out == "no-fields" || strings.Contains(out, "-open") {
-		pickCustomBirthdayOnTarget(t, cfg)
-		time.Sleep(400 * time.Millisecond)
-	}
-	time.Sleep(800 * time.Millisecond)
+	// Native selects sometimes report values but React never enables Save —
+	// always also drive the visible Month/Day/Year comboboxes.
+	pickCustomBirthdayOnTarget(t, cfg)
+	time.Sleep(500 * time.Millisecond)
+	_ = evalJSONOnChromeTarget(t, chromeSetBirthdayFieldsJS(cfg.BirthdayYear, cfg.BirthdayMonth, cfg.BirthdayDay), &out)
+	setupSay("Birthday fields (re-set): %s", out)
+
 	saveJS := `(() => {
-		const vis = (el) => el && el.getBoundingClientRect().width > 2 && el.getBoundingClientRect().height > 2;
-		const save = [...document.querySelectorAll('button')].find(b => vis(b) && /^(save|guardar|enregistrer|speichern|сохранить)$/i.test((b.innerText || '').trim()));
+		const vis = (el) => {
+			if (!el || !el.getBoundingClientRect) return false;
+			const r = el.getBoundingClientRect();
+			const s = getComputedStyle(el);
+			return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+		};
+		const textOf = (el) => (el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+		const nearBirthday = (el) => {
+			let n = el;
+			for (let i = 0; i < 10 && n; i++, n = n.parentElement) {
+				const t = textOf(n);
+				if (/birthday|date of birth|fecha de nacimiento|anniversaire|geburtstag/i.test(t) && t.length < 400) return true;
+			}
+			return false;
+		};
+		const btns = [...document.querySelectorAll('button, [role="button"]')].filter(vis)
+			.filter(b => /^(save|guardar|enregistrer|speichern|сохранить)$/i.test(textOf(b)));
+		btns.sort((a, b) => {
+			const as = nearBirthday(a) ? 0 : 1;
+			const bs = nearBirthday(b) ? 0 : 1;
+			return as - bs;
+		});
+		const save = btns[0];
 		if (!save) return 'no-save';
 		if (save.disabled || save.getAttribute('aria-disabled') === 'true') return 'save-disabled';
+		save.scrollIntoView({block:'center', inline:'nearest'});
 		save.click();
 		return 'save';
 	})()`
+
 	var saved string
-	_ = evalJSONOnChromeTarget(t, saveJS, &saved)
-	if saved != "save" {
-		setupSay("Birthday Save not ready (%s) — picking 29 Dec 2000 again.", saved)
-		pickCustomBirthdayOnTarget(t, cfg)
-		time.Sleep(600 * time.Millisecond)
-		saved = ""
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
 		_ = evalJSONOnChromeTarget(t, saveJS, &saved)
+		if saved == "save" {
+			break
+		}
+		if saved == "save-disabled" || saved == "no-save" {
+			pickCustomBirthdayOnTarget(t, cfg)
+			_ = evalJSONOnChromeTarget(t, chromeSetBirthdayFieldsJS(cfg.BirthdayYear, cfg.BirthdayMonth, cfg.BirthdayDay), &out)
+		}
+		time.Sleep(450 * time.Millisecond)
 	}
 	setupSay("Birthday: %s", saved)
 	if saved != "save" {
-		// Tumblr often hides Save when the date is already locked/set, or when
-		// only custom pickers opened without a page-level Save button.
-		var status string
-		_ = evalJSONOnChromeTarget(t, chromeAgeStatusJS, &status)
-		if strings.Contains(status, `"birthday":"set"`) || strings.Contains(status, `"birthday":"locked"`) {
+		st := readSetupPageStatus()
+		if sessionBirthdayOK(st) {
 			setupSay("Birthday already set/locked — continuing.")
 			return nil
 		}
-		if strings.Contains(status, "December 29, 2000") || strings.Contains(status, "29 December 2000") {
+		var raw string
+		_ = evalJSONOnChromeTarget(t, chromeAgeStatusJS, &raw)
+		if strings.Contains(raw, "December 29, 2000") || strings.Contains(raw, "29 December 2000") {
 			setupSay("Birthday text already shows 29 Dec 2000 — continuing.")
 			return nil
 		}
 		return fmt.Errorf("birthday not saved (%s)", saved)
 	}
-	time.Sleep(1500 * time.Millisecond)
-	for i := 0; i < 10; i++ {
+	time.Sleep(500 * time.Millisecond)
+	for i := 0; i < 8; i++ {
 		if clickAgeConfirmOnTargets() != "" {
-			time.Sleep(800 * time.Millisecond)
+			time.Sleep(350 * time.Millisecond)
 			clickAgeConfirmOnTargets()
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	// Confirm the page actually shows the locked/set birthday before leaving.
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if sessionBirthdayOK(readSetupPageStatus()) {
+			setupSay("Birthday confirmed on account settings.")
 			return nil
 		}
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
-	return nil
+	if sessionBirthdayOK(readSetupPageStatus()) {
+		return nil
+	}
+	return fmt.Errorf("birthday save clicked but page still shows unset")
 }
 
 func pickCustomBirthdayOnTarget(t chromeJSONTarget, cfg profileSetupConfig) {

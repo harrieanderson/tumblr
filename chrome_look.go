@@ -230,7 +230,20 @@ func openOrNavigateTab(pageURL string) (chromeJSONTarget, error) {
 		if err := navigateChromeTab(t, pageURL); err != nil {
 			return chromeJSONTarget{}, err
 		}
-		time.Sleep(2 * time.Second)
+		// Brief settle — keep settings hops snappy for batch setup.
+		deadline := time.Now().Add(800 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if list2, err := listChromeTargets(); err == nil {
+				for _, x := range list2 {
+					if x.ID == t.ID && strings.Contains(strings.ToLower(x.URL), want) {
+						t = x
+						goto navigated
+					}
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	navigated:
 	}
 	if list, err := listChromeTargets(); err == nil {
 		for _, x := range list {

@@ -65,15 +65,24 @@ func TestLoginFillDoesNotPretendSuccess(t *testing.T) {
 }
 
 func TestInvisibleRecaptchaDoesNotBlockLoginRefill(t *testing.T) {
-	if strings.Contains(tumblrCaptchaVisibleJS, "const t = ((document.body") {
-		t.Fatal("normal login pages contain hidden reCAPTCHA copy; whole-body matching causes false captcha detection")
+	if !strings.Contains(tumblrCaptchaVisibleJS, "vis(f, 100, 40)") {
+		t.Fatal("anchor reCAPTCHA checkbox must be detected at widget size")
 	}
-	if !strings.Contains(tumblrCaptchaVisibleJS, "r.width > 120") ||
-		!strings.Contains(tumblrCaptchaVisibleJS, "r.height > 60") {
-		t.Fatal("a captcha iframe must be visibly challenge-sized")
+	if !strings.Contains(tumblrCaptchaVisibleJS, "vis(f, 120, 60)") {
+		t.Fatal("a captcha challenge iframe must be visibly challenge-sized")
 	}
 	if !strings.Contains(tumblrCaptchaVisibleJS, "complete the captcha") {
 		t.Fatal("visible challenge copy should still be detected")
+	}
+	if !strings.Contains(tumblrCaptchaVisibleJS, "check the box above") {
+		t.Fatal("Tumblr 'Check the box above to continue' must count as captcha")
+	}
+	src, err := os.ReadFile("chrome.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "clickRecaptchaCheckboxIfPresent") {
+		t.Fatal("login must try the I'm-not-a-robot checkbox then wait")
 	}
 }
 

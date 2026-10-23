@@ -27,12 +27,20 @@ import (
 type chromeTransport struct {
 	accountID string
 	dialer    *net.Dialer
+	// rawDial optionally replaces CONNECT/TCP dial (tests only). Nil keeps
+	// production dialHTTPProxyCONNECT / dialer.DialContext. Receives ctx so
+	// callers can inspect proxyLeaseFromContext without opening sockets.
+	rawDial func(ctx context.Context, proxyURL *url.URL, addr string) (net.Conn, error)
 
 	initOnce sync.Once
 	h2       *http2.Transport
 	h1       *http.Transport
 }
 
+// newChromeTransport builds the uTLS RoundTripper. Production callers must wrap
+// with wrapProxyPace so acquireLease commits sticky before CONNECT. Bare use
+// is allowed only via the guarded dial path (dialChromeTLS acquires+releases
+// when the request ctx has no outer paced lease).
 func newChromeTransport(accountID string) http.RoundTripper {
 	return &chromeTransport{
 		accountID: accountSlug(accountID),
@@ -120,6 +128,7 @@ func (t *chromeTransport) proxyFunc() func(*http.Request) (*url.URL, error) {
 func (t *chromeTransport) resolveProxy(ctx context.Context) (*url.URL, error) {
 	r := proxyPool()
 	if r.enabled() {
+		// Sticky-read-only: never soft-bind here.
 		return r.proxyURLFor(t.accountID)
 	}
 	// Match prior behaviour when pool is off.
@@ -127,13 +136,29 @@ func (t *chromeTransport) resolveProxy(ctx context.Context) (*url.URL, error) {
 }
 
 func (t *chromeTransport) dialChromeTLS(ctx context.Context, addr string) (net.Conn, error) {
+	r := proxyPool()
+	ownLease := ""
+	if r.enabled() {
+		if _, ok := proxyLeaseFromContext(ctx); !ok {
+			// Bare transport / no outer paced lease — acquire for this dial only.
+			id, err := r.acquireLease(ctx, t.accountID)
+			if err != nil {
+				return nil, err
+			}
+			ownLease = id
+			defer r.releaseLease(ownLease)
+		}
+	}
+
 	proxyURL, err := t.resolveProxy(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	var raw net.Conn
-	if proxyURL != nil {
+	if t.rawDial != nil {
+		raw, err = t.rawDial(ctx, proxyURL, addr)
+	} else if proxyURL != nil {
 		switch strings.ToLower(proxyURL.Scheme) {
 		case "http", "https":
 			raw, err = dialHTTPProxyCONNECT(ctx, t.dialer, proxyURL, addr)
@@ -157,6 +182,10 @@ func (t *chromeTransport) dialChromeTLS(ctx context.Context, addr string) (net.C
 		InsecureSkipVerify: false,
 		MinVersion:         utls.VersionTLS12,
 	}
+	// HelloChrome_Auto tracks the latest uTLS Chrome ClientHello. Keep the
+	// claimed HTTP major (fingerprint()) near the installed browser so Auto
+	// and UA/sec-ch-ua stay aligned after Chrome updates. Full H2 SETTINGS /
+	// WINDOW_UPDATE / priority mimicry is intentionally not done here.
 	uconn := utls.UClient(raw, cfg, utls.HelloChrome_Auto)
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
@@ -198,7 +227,7 @@ func dialHTTPProxyCONNECT(ctx context.Context, d *net.Dialer, proxyURL *url.URL,
 		b.WriteString("\r\n")
 	}
 	b.WriteString("User-Agent: ")
-	b.WriteString(chromeUA)
+	b.WriteString(fingerprint().UA)
 	b.WriteString("\r\nProxy-Connection: Keep-Alive\r\n\r\n")
 
 	if deadline, ok := ctx.Deadline(); ok {

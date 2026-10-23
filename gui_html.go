@@ -437,7 +437,7 @@ const guiHTML = `<!DOCTYPE html>
         <button type="button" id="btnTopPlus1" class="ghost" data-keep="1" aria-label="Increase top count by 1">+1</button>
         <button type="button" id="btnTopPlus10" class="ghost" data-keep="1" aria-label="Increase top count by 10">+10</button>
       </div>
-      <p class="hint">Top accounts are ranked by followers. Selects enabled, logged-in accounts, once per blog, across all filters.</p>
+      <p class="hint">List order: most followers first; same count → Zoey-setup above not-setup. Top N uses that order.</p>
       <div id="acctList" class="acct-list"></div>
       <div id="acctCount" class="count">0 selected</div>
       <div class="acct-tools" style="margin-top:12px;margin-bottom:0">
@@ -627,6 +627,9 @@ function accountsByFollowers() {
   return accountsCache.slice().sort(function (a, b) {
     const df = (b.followers || 0) - (a.followers || 0);
     if (df !== 0) return df;
+    const az = a.zoeySetup ? 1 : 0;
+    const bz = b.zoeySetup ? 1 : 0;
+    if (az !== bz) return bz - az; // Zoey-setup before not-setup
     return String(a.id || "").toLowerCase().localeCompare(String(b.id || "").toLowerCase());
   });
 }
@@ -642,6 +645,7 @@ function renderAccountList() {
     const title = a.blog ? "@" + a.blog : a.id;
     const extra = a.blog ? " · " + a.id : "";
     const fol = a.followers ? " · " + a.followers + " followers" : "";
+    const zoey = a.zoeySetup ? " · Zoey" : "";
     const checked = selectedIds[a.id] ? " checked" : "";
     const initial = escapeHtml(((a.blog || a.id || "?").replace(/^@/, "").charAt(0) || "?").toUpperCase());
     const live = a.loggedIn ? " live" : "";
@@ -650,7 +654,7 @@ function renderAccountList() {
         '<label class="grow">' +
           '<input type="checkbox" data-id="' + escapeHtml(a.id) + '"' + checked + ' />' +
           '<span class="avatar">' + initial + '</span>' +
-          '<span><strong>' + escapeHtml(title) + '</strong><div class="meta"><span class="dot' + live + '"></span>' + mark + escapeHtml(extra + fol) + '</div></span>' +
+          '<span><strong>' + escapeHtml(title) + '</strong><div class="meta"><span class="dot' + live + '"></span>' + mark + escapeHtml(extra + fol + zoey) + '</div></span>' +
         '</label>' +
         '<button type="button" class="btn-open-one" data-id="' + escapeHtml(a.id) + '" data-keep="1">Watch</button>' +
       '</div>'

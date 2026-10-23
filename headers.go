@@ -12,21 +12,22 @@ func setCommonHeaders(req *http.Request, auth Auth) {
 	// Chrome/redpop order matters for fingerprinting. Clear then set in sequence
 	// so Go 1.22+ serializes insertion order on the wire.
 	clearRequestHeaders(req)
+	fp := fingerprint()
 	setHeaderOrder(req,
 		"Authorization", "Bearer "+auth.Bearer,
-		"sec-ch-ua-platform", `"Windows"`,
+		"sec-ch-ua-platform", fp.SecCHUAPlatform,
 		"X-Ad-Blocker-Enabled", "0",
 		"X-Version", "redpop/3/0//redpop/",
-		"sec-ch-ua", chromeSecCHUA,
+		"sec-ch-ua", fp.SecCHUA,
 		"sec-ch-ua-mobile", "?0",
-		"User-Agent", chromeUA,
+		"User-Agent", fp.UA,
 		"Accept", "application/json;format=camelcase",
 		"Origin", "https://www.tumblr.com",
 		"Sec-Fetch-Site", "same-origin",
 		"Sec-Fetch-Mode", "cors",
 		"Sec-Fetch-Dest", "empty",
 		"Accept-Encoding", chromeAcceptEncoding,
-		"Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8",
+		"Accept-Language", fp.AcceptLanguage,
 		"Cookie", matureCookieHeader(auth.Cookie),
 		"Priority", "u=1, i",
 	)
@@ -35,19 +36,20 @@ func setCommonHeaders(req *http.Request, auth Auth) {
 
 func setHTMLHeaders(req *http.Request, auth Auth) {
 	clearRequestHeaders(req)
+	fp := fingerprint()
 	setHeaderOrder(req,
 		"Upgrade-Insecure-Requests", "1",
-		"User-Agent", chromeUA,
+		"User-Agent", fp.UA,
 		"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-		"sec-ch-ua", chromeSecCHUA,
+		"sec-ch-ua", fp.SecCHUA,
 		"sec-ch-ua-mobile", "?0",
-		"sec-ch-ua-platform", `"Windows"`,
+		"sec-ch-ua-platform", fp.SecCHUAPlatform,
 		"Sec-Fetch-Site", "same-origin",
 		"Sec-Fetch-Mode", "navigate",
 		"Sec-Fetch-User", "?1",
 		"Sec-Fetch-Dest", "document",
 		"Accept-Encoding", chromeAcceptEncoding,
-		"Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8",
+		"Accept-Language", fp.AcceptLanguage,
 		"Cookie", matureCookieHeader(auth.Cookie),
 		"Priority", "u=0, i",
 	)

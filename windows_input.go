@@ -160,6 +160,25 @@ func findChromeWindowForAccount(accountID string) uintptr {
 	return 0
 }
 
+// raiseLiveChromeWindow gently restores the bot Chrome window after launch.
+// Does not maximize or move the window (that was stealing Harrie's monitor).
+func raiseLiveChromeWindow(accountID string) {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		hwnd := findChromeWindowForAccount(accountID)
+		if hwnd == 0 {
+			hwnd = findWindowContaining("Tumblr")
+		}
+		if hwnd == 0 {
+			return
+		}
+		// SW_RESTORE only if minimized — never SW_MAXIMIZE.
+		procShowWindow.Call(hwnd, 9)
+		procSetForegroundWindow.Call(hwnd)
+		return
+	}
+}
+
 func findWindowsSecurityHWND() uintptr {
 	if hwnd := findWindowContaining("Windows Security"); hwnd != 0 {
 		return hwnd

@@ -20,11 +20,13 @@ const (
 	activeAccountFile        = "config/active-account.json"
 	profilesAuthDir          = "config/profiles"
 	profilesDataDir          = "data/profiles"
-	ageVerifyAccountsFile    = "config/age-verify-accounts.json"
-	setupProfileAccountsFile = "config/setup-profile-accounts.json"
-	fixBioAccountsFile       = "config/fix-bio-accounts.json"
+	ageVerifyAccountsFile = "config/age-verify-accounts.json"
+	fixBioAccountsFile    = "config/fix-bio-accounts.json"
 	zoeyFullySetupFile       = "config/zoey-fully-setup.json"
 )
+
+// setupProfileAccountsFile is overridable with -setup-accounts for parallel lanes.
+var setupProfileAccountsFile = "config/setup-profile-accounts.json"
 
 type Account struct {
 	ID       string `json:"id"`
@@ -808,6 +810,7 @@ type accountPublic struct {
 	Followers int    `json:"followers"`
 	LoggedIn  bool   `json:"loggedIn"`
 	Active    bool   `json:"active"`
+	ZoeySetup bool   `json:"zoeySetup"` // full/essential Zoey look (or on fully-setup list)
 }
 
 func publicAccounts() []accountPublic {
@@ -819,6 +822,7 @@ func publicAccountsWithTally() ([]accountPublic, followerTally) {
 	now := time.Now().Local()
 	tally := followerTally{Date: now.Format("2006-01-02")}
 	cur, _ := currentAccount()
+	zoey := zoeySetupAccountSet()
 	var out []accountPublic
 	for _, a := range allAccounts() {
 		auth := peekAccountAuth(a.ID)
@@ -839,6 +843,7 @@ func publicAccountsWithTally() ([]accountPublic, followerTally) {
 			Followers: followers,
 			LoggedIn:  authHasSID(auth),
 			Active:    a.ID == cur.ID,
+			ZoeySetup: zoey[a.ID],
 		})
 		if enabled && (log.Latest.At != "" || followers > 0) {
 			tally.Total += followers
@@ -850,10 +855,50 @@ func publicAccountsWithTally() ([]accountPublic, followerTally) {
 	return out, tally
 }
 
+// zoeySetupAccountSet marks accounts that already have the Zoey look
+// (status full/essential in zoey-setup-status.json, or listed in zoey-fully-setup.json).
+func zoeySetupAccountSet() map[string]bool {
+	out := map[string]bool{}
+	if ids, err := loadFullySetupAccountIDs(); err == nil {
+		for _, id := range ids {
+			out[accountSlug(id)] = true
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join("config", "zoey-setup-status.json"))
+	if err != nil {
+		return out
+	}
+	var wrap struct {
+		Accounts []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"accounts"`
+	}
+	if json.Unmarshal(raw, &wrap) != nil {
+		return out
+	}
+	for _, a := range wrap.Accounts {
+		id := accountSlug(a.ID)
+		if id == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(a.Status)) {
+		case "full", "essential":
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// sortAccountsByFollowers orders GUI accounts by followers desc, then
+// Zoey-setup before not-setup, then account id.
 func sortAccountsByFollowers(accs []accountPublic) {
 	sort.SliceStable(accs, func(i, j int) bool {
 		if accs[i].Followers != accs[j].Followers {
 			return accs[i].Followers > accs[j].Followers
+		}
+		if accs[i].ZoeySetup != accs[j].ZoeySetup {
+			return accs[i].ZoeySetup
 		}
 		return strings.ToLower(accs[i].ID) < strings.ToLower(accs[j].ID)
 	})

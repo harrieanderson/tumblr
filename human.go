@@ -10,12 +10,6 @@ import (
 	"time"
 )
 
-// Chrome client hints — keep UA / sec-ch-ua in sync (desktop Windows Chrome).
-const (
-	chromeUA      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-	chromeSecCHUA = `"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"`
-)
-
 func newHumanClient() *http.Client {
 	return newHumanClientFor("")
 }
@@ -80,7 +74,7 @@ func humanThink() {
 func persistMaturePref(auth *Auth) {
 	auth.Cookie = matureCookieHeader(auth.Cookie)
 	if !strings.Contains(auth.Cookie, "tz=") {
-		auth.Cookie += "; tz=Europe/London"
+		auth.Cookie += "; tz=" + fingerprint().Timezone
 	}
 	_ = saveAuth(*auth)
 }

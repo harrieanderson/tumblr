@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +85,17 @@ func bannerForCurrentAccount(pics []string) string {
 	if len(pics) == 0 {
 		return ""
 	}
-	return pics[rand.Intn(len(pics))]
+	// Stable per account — random picks made retries look like "set twice".
+	acc, ok := currentAccount()
+	if !ok {
+		return pics[0]
+	}
+	for i, a := range allAccounts() {
+		if a.ID == acc.ID {
+			return pics[i%len(pics)]
+		}
+	}
+	return pics[0]
 }
 
 func picForCurrentAccount(pics []string) string {

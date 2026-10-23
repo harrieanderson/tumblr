@@ -33,6 +33,11 @@ func defaultZoeyUsernames() []string {
 		"lillymist", "zoeyfairy", "cometzoey", "lillykiss", "zoeybabe",
 		"lunazoeyy", "lillycrush", "zoeyhoney", "plushzoey", "lillygloww",
 		"zoeypixie", "aurora-zoey", "lillycosmix", "zoeybliss", "sweetzoeybun",
+		"bunbunzoey", "zoeydusk", "lillydawn", "zoeymochi", "lillymochi",
+		"zoeyribbon", "stardustzoey", "peachbunzoey", "nebulazoey", "sparklezoey",
+		"moonbeamzoey", "starlitzoey", "dreamyzoey", "velvetbunzoey", "nightzoeybun",
+		"spacebunnyz", "glowsoftzoey", "tinybunzoey", "softmoonzoey", "orbitsoftie",
+		"twilightzoey", "emberbunzoey", "skyebunzoey", "fawnsoftlilly", "lyrazoeybun",
 	}
 }
 
@@ -119,6 +124,35 @@ func validTumblrUsername(s string) bool {
 	return true
 }
 
+// usernameCandidatesForRename: short twists of the wanted name, then fresh
+// pool/generated names — avoids endless lillydawnnnn letter-doubling.
+func usernameCandidatesForRename(want string, used map[string]bool) []string {
+	want = normalizeBlogName(want)
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = normalizeBlogName(s)
+		if !validTumblrUsername(s) || seen[s] || used[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, v := range usernameVariants(want) {
+		add(v)
+		if len(out) >= 6 {
+			break
+		}
+	}
+	for _, p := range append(zoeyUsernamePool(), generatedZoeyUsernames()...) {
+		add(p)
+		if len(out) >= 40 {
+			break
+		}
+	}
+	return out
+}
+
 func usernameVariants(base string) []string {
 	base = normalizeBlogName(base)
 	var out []string
@@ -136,15 +170,21 @@ func usernameVariants(base string) []string {
 		last := string(r[len(r)-1])
 		add(base + last)
 		add(base + last + last)
+		add(base + last + last + last)
 	}
-	for _, extra := range []string{"y", "x", "z", "s", "ie", "yy"} {
+	for _, extra := range []string{"y", "x", "z", "s", "ie", "yy", "xx", "zz", "xo", "bb", "uwu", "soft", "bun"} {
 		add(base + extra)
 	}
 	if r := []rune(base); len(r) >= 2 {
 		add(string(r[:len(r)-1]) + string(r[len(r)-2]) + string(r[len(r)-1]))
 	}
-	for _, n := range []string{"7", "4", "9", "8", "0"} {
+	for _, n := range []string{"7", "4", "9", "8", "0", "22", "27", "99", "11"} {
 		add(base + n)
+	}
+	// Prefix twists when Tumblr has the base forms locked.
+	for _, pre := range []string{"lil", "its", "just", "hey", "ok", "xo"} {
+		add(pre + base)
+		add(pre + "-" + base)
 	}
 	return out
 }
@@ -228,14 +268,37 @@ func pickZoeyUsername(accountID, current string) string {
 // generatedZoeyUsernames backs up the hand-picked pool once every name in it
 // is taken, so a blog never gets stuck with its old non-Zoey username.
 func generatedZoeyUsernames() []string {
-	heads := []string{"zoey", "lilly"}
-	words := []string{"moon", "star", "peach", "velvet", "cloud", "honey", "cherry", "sugar",
+	heads := []string{"zoey", "lilly", "zoe", "lil", "bunny", "cosmic"}
+	words := []string{
+		"moon", "star", "peach", "velvet", "cloud", "honey", "cherry", "sugar",
 		"dream", "petal", "glow", "kitty", "bunbun", "angel", "pixie", "lunar", "rosy", "candy",
-		"mochi", "berry", "skye", "nova", "fairy", "daisy", "silk", "plum", "minty", "cosmo"}
+		"mochi", "berry", "skye", "nova", "fairy", "daisy", "silk", "plum", "minty", "cosmo",
+		"orbit", "haze", "mist", "bloom", "crush", "spark", "dusk", "dawn", "frost", "latte",
+		"ribbon", "satin", "plush", "lilac", "coral", "jade", "opal", "iris", "rose", "ivy",
+		"pearl", "maple", "wisp", "fawn", "lyra", "mira", "cleo", "ember", "halo", "charm",
+		"pulse", "quill", "meadow", "prism", "solace", "ripple", "blush", "willow", "amber",
+		"violet", "flora", "nectar", "sprinkle", "comet", "aurora", "galaxy", "nebula", "astro",
+		"stardust", "moonbeam", "starlit", "twilight", "softie", "babyz",
+	}
+	tails := []string{"", "z", "x", "y", "ie", "yy", "bun", "soft"}
 	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = normalizeBlogName(s)
+		if !validTumblrUsername(s) || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
 	for _, w := range words {
 		for _, h := range heads {
-			out = append(out, h+w, w+h, h+"-"+w)
+			for _, t := range tails {
+				add(h + w + t)
+				add(w + h + t)
+			}
+			add(h + "-" + w)
+			add(w + "-" + h)
 		}
 	}
 	return out
@@ -595,7 +658,9 @@ func chromeBlogLookStatusJS(accent, background, wantUser string) string {
 			const r = img.getBoundingClientRect();
 			if (r.width > 220 && r.height > 70 && r.top < 520) add(img.currentSrc || img.src);
 		}
-		const bannerOK = !!header && /blob:|media\.tumblr\.com/i.test(header);
+		// media.tumblr.com = persisted; blob = just-uploaded crop still open. Both count
+		// as progress. Solid black with no url must NOT count (that was the false ok).
+		const bannerOK = !!header && (/media\.tumblr\.com/i.test(header) || /^blob:/i.test(header)) && !/default_header/i.test(header);
 		const href = (location.pathname || '').toLowerCase();
 		const userOK = !!(wantUser && href.indexOf('/settings/blog/' + wantUser) >= 0);
 		return {
@@ -1032,7 +1097,7 @@ func changeBlogUsernameOnTarget(t chromeJSONTarget, want string) string {
 	}
 	if opened != "" && opened != "already" {
 		fmt.Println("Clicked username:", opened)
-		time.Sleep(1200 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 	}
 	if !shouldFillUsernameField(opened) {
 		fmt.Println("Username editor not open — leaving other fields alone.")
@@ -1189,43 +1254,61 @@ func applyBlogLookParts(name string, cfg profileSetupConfig, doTheme bool) error
 		}
 	}
 	colorsApplied := false
-	for i := 0; i < 2 && !themeOK; i++ {
+	headerUploaded := false
+	if doTheme && !themeOK {
 		dismissOverlaysOnPort()
 		if err := applyBlogThemeOnTarget(t, cfg, header); err != nil {
 			fmt.Println("Theme:", err)
-			continue
+			// One retry only when the header editor never opened — not a second upload
+			// after a successful set (that was double-applying the background).
+			if strings.Contains(err.Error(), "chooser did not open") || strings.Contains(err.Error(), "button not found") {
+				fmt.Println("Banner editor missing — one reopen retry, then move on if blocked.")
+				if nt, err2 := openBlogSettingsTab(name); err2 == nil {
+					t = nt
+				}
+				dismissOverlaysOnPort()
+				if err2 := applyBlogThemeOnTarget(t, cfg, header); err2 != nil {
+					fmt.Println("Theme retry:", err2)
+				} else {
+					headerUploaded = true
+				}
+			}
 		} else {
-			colorsApplied = true
+			headerUploaded = true
 		}
-		dismissOverlaysOnPort()
-		if err := clickAppearanceSaveOnTarget(t); err != nil {
-			fmt.Println("Save:", err)
-			continue
-		}
-		// Verify persisted server values, not an unsaved preview or generic swatch.
-		var st blogLookPageStatus
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			p, err := fetchBlogProfile(newHumanClient(), auth, name)
-			if err != nil {
-				return fmt.Errorf("verify saved theme: %w", err)
+		if headerUploaded {
+			dismissOverlaysOnPort()
+			if err := clickAppearanceSaveOnTarget(t); err != nil {
+				fmt.Println("Save:", err)
+			} else {
+				colorsApplied = true
+				time.Sleep(500 * time.Millisecond)
+				st := readBlogLookStatus(t, cfg, "")
+				fmt.Printf("Look check (page): accent=%s background=%s banner=%s header=%s\n",
+					setupFlag(st.AccentOK), setupFlag(st.BackgroundOK), setupFlag(st.BannerOK), st.Header)
+				// Trust a successful upload+save — never upload the banner a second time.
+				themeOK = true
 			}
-			st = savedThemeStatus(p, cfg)
-			if themeLooksDone(st, colorsApplied) {
-				break
-			}
-			time.Sleep(time.Second)
 		}
-		fmt.Printf("Look check: accent=%s background=%s banner=%s (accent=%s bg=%s preview=%s header=%s)\n",
-			setupFlag(st.AccentOK), setupFlag(st.BackgroundOK), setupFlag(st.BannerOK),
-			st.Accent, st.Background, st.PreviewBg, st.Header)
-		if themeLooksDone(st, colorsApplied) {
-			themeOK = true
-			break
+		if !themeOK && !skipSetupAgeKey {
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				p, err := fetchBlogProfile(newHumanClient(), auth, name)
+				if err != nil {
+					fmt.Println("Theme verify:", err)
+					break
+				}
+				api := savedThemeStatus(p, cfg)
+				if themeLooksDone(api, colorsApplied) {
+					themeOK = true
+					break
+				}
+				time.Sleep(400 * time.Millisecond)
+			}
 		}
 	}
-	if !themeOK {
-		fmt.Println("Banner/colors did not confirm after retries — continuing with username and account settings.")
+	if !themeOK && doTheme {
+		fmt.Println("Banner blocked — continuing (Tumblr hid/blocked the header editor).")
 	}
 
 	if !skipRename && want != "" && normalizeBlogName(want) != normalizeBlogName(name) {
@@ -1234,26 +1317,46 @@ func applyBlogLookParts(name string, cfg profileSetupConfig, doTheme bool) error
 			return skipBlogLook("Could not reopen settings for username")
 		}
 		renamed := false
-		for _, cand := range usernameVariants(want) {
-			if usedZoeyUsernames(accID)[cand] {
+		used := usedZoeyUsernames(accID)
+		cands := usernameCandidatesForRename(want, used)
+		maxTries := 8
+		if skipSetupAgeKey {
+			maxTries = 4 // don't sit twisting lillydawnnnn forever
+		}
+		tries := 0
+		for _, cand := range cands {
+			if tries >= maxTries {
+				fmt.Println("Username: hit try cap — continuing.")
+				break
+			}
+			if used[cand] {
 				continue
 			}
+			tries++
 			dismissOverlaysOnPort()
 			fmt.Println("Trying username:", cand)
 			status := changeBlogUsernameOnTarget(t, cand)
 			if status == "taken" {
-				fmt.Println("Username taken:", cand, "— twisting it")
+				fmt.Println("Username taken:", cand, "— next candidate")
 				markUsernameTaken(cand)
+				used[cand] = true
 				continue
 			}
 			if status == "missing" || status == "error" {
 				fmt.Println("Username status:", status)
 				break
 			}
-			time.Sleep(1500 * time.Millisecond)
-			if newName, err := syncAuthIdentity(newHumanClient(), &auth); err == nil && usableBlogName(newName) {
+			time.Sleep(200 * time.Millisecond)
+			// Batch mode: trust UI save — proxy identity sync is slow/401 and stalls the queue.
+			if skipSetupAgeKey && status == "ok" {
+				name = cand
+				setupBlogName = cand
+			} else if newName, err := syncAuthIdentity(newHumanClient(), &auth); err == nil && usableBlogName(newName) {
 				name = newName
 				setupBlogName = newName
+			} else if status == "ok" {
+				name = cand
+				setupBlogName = cand
 			}
 			st := readBlogLookStatus(t, cfg, cand)
 			if st.UserOK || normalizeBlogName(name) == cand || status == "ok" {

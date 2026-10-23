@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -86,15 +88,39 @@ type proxyRuntime struct {
 	recent     []time.Time
 }
 
+// proxySleeper parks until d elapses or ctx is canceled.
+// Tests inject a no-op / channel-driven sleeper via proxyRouter.sleep.
+type proxySleeper func(ctx context.Context, d time.Duration) error
+
+func contextSleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 type proxyRouter struct {
-	mu      sync.Mutex
-	cfg     ProxyConfig
-	pool    []*proxyEndpoint
-	byID    map[string]*proxyEndpoint
-	assign  map[string]proxyAssignment // accountID -> sticky proxy
-	rt      map[string]*proxyRuntime   // proxyID -> runtime
-	accRT   map[string]*proxyRuntime   // accountID -> rate window
-	loaded  time.Time
+	mu     sync.Mutex
+	cfg    ProxyConfig
+	pool   []*proxyEndpoint
+	byID   map[string]*proxyEndpoint
+	assign map[string]proxyAssignment // accountID -> sticky proxy
+	rt     map[string]*proxyRuntime   // proxyID -> runtime
+	accRT  map[string]*proxyRuntime   // accountID -> rate window
+	loaded time.Time
+	// sleep is context-aware parking for lease waits and 429/503 retries.
+	// Nil means contextSleep. Field (not package var) keeps parallel tests isolated.
+	sleep proxySleeper
+	// freshBindCount increments only when beginRequestLocked commits a previously
+	// unbound (or expired/rebound) account sticky. Test-only; reset per test.
+	freshBindCount int
 }
 
 var (
@@ -109,6 +135,7 @@ func newProxyRouter(cfg ProxyConfig) *proxyRouter {
 		assign: map[string]proxyAssignment{},
 		rt:     map[string]*proxyRuntime{},
 		accRT:  map[string]*proxyRuntime{},
+		sleep:  contextSleep,
 	}
 	r.applyConfig(cfg)
 	return r
@@ -122,10 +149,41 @@ func proxyPool() *proxyRouter {
 			assign: map[string]proxyAssignment{},
 			rt:     map[string]*proxyRuntime{},
 			accRT:  map[string]*proxyRuntime{},
+			sleep:  contextSleep,
 		}
 		proxyShared.reload()
 	})
 	return proxyShared
+}
+
+func (r *proxyRouter) doSleep(ctx context.Context, d time.Duration) error {
+	fn := r.sleep
+	if fn == nil {
+		fn = contextSleep
+	}
+	return fn(ctx, d)
+}
+
+// persistedHasAccountLocked mirrors saveStateLocked's assignment filter.
+// Must be called with r.mu held. Test-only helper for deferred-sticky asserts.
+func (r *proxyRouter) persistedHasAccountLocked(accountID string) bool {
+	now := time.Now()
+	a, ok := r.assign[accountSlug(accountID)]
+	return ok && a.StickyUntil.After(now)
+}
+
+// inflightFor is a test-only helper to sample capacity without racing on maps.
+func (r *proxyRouter) inflightFor(proxyID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if proxyID == "" {
+		return 0
+	}
+	rt := r.rt[proxyID]
+	if rt == nil {
+		return 0
+	}
+	return rt.inFlight
 }
 
 // boostProxyPaceForWipe slightly raises wipe throughput without touching
@@ -382,15 +440,25 @@ func pruneRecent(times []time.Time, now time.Time, window time.Duration) []time.
 func (r *proxyRouter) pickProxy(accountID string) (*proxyEndpoint, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.pickProxyLocked(accountID), nil
+}
+
+// pickProxyLocked must be called with r.mu held.
+// Sticky accounts stay on their binding even at capacity (wait-on-sticky).
+// Fresh assigns hard-filter peers with inFlight >= cap when any free healthy
+// peer exists; if every healthy peer is at cap, soft-pick lowest loadScore and wait.
+// Unbound accounts return a candidate only — sticky is committed in beginRequestLocked
+// so saveStateLocked never observes a half-binding while waiting.
+func (r *proxyRouter) pickProxyLocked(accountID string) *proxyEndpoint {
 	if !r.cfg.Enabled || len(r.pool) == 0 {
-		return nil, nil
+		return nil
 	}
 	now := time.Now()
 	accountID = accountSlug(accountID)
 
 	if a, ok := r.assign[accountID]; ok {
 		if ep := r.byID[a.ProxyID]; ep != nil && a.StickyUntil.After(now) && r.healthyLocked(ep, now) {
-			return ep, nil
+			return ep
 		}
 	}
 
@@ -412,6 +480,19 @@ func (r *proxyRouter) pickProxy(accountID string) (*proxyEndpoint, error) {
 			}
 		}
 		candidates = []*proxyEndpoint{best}
+	} else {
+		// Fresh assign: prefer peers under concurrency cap when any have room.
+		capN := r.cfg.PerProxyMaxConcurrent
+		var underCap []*proxyEndpoint
+		for _, ep := range candidates {
+			if r.runtime(ep.id).inFlight < capN {
+				underCap = append(underCap, ep)
+			}
+		}
+		if len(underCap) > 0 {
+			candidates = underCap
+		}
+		// else: all healthy peers at cap — soft-pick lowest loadScore and wait (same as sticky path).
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -421,98 +502,97 @@ func (r *proxyRouter) pickProxy(accountID string) (*proxyEndpoint, error) {
 		}
 		return candidates[i].id < candidates[j].id
 	})
-	ep := candidates[0]
-	r.assign[accountID] = proxyAssignment{
-		ProxyID:     ep.id,
-		StickyUntil: now.Add(time.Duration(r.cfg.StickyMinutes) * time.Minute),
-	}
-	r.saveStateLocked()
-	return ep, nil
+	return candidates[0]
 }
 
+// proxyURLFor is sticky-read-only: returns the bound proxy URL when a healthy
+// sticky assignment exists. Unbound accounts get (nil, nil) — no soft-pick and
+// no assign write. Fresh sticky is committed only in beginRequestLocked.
 func (r *proxyRouter) proxyURLFor(accountID string) (*url.URL, error) {
-	ep, err := r.pickProxy(accountID)
-	if err != nil {
-		return nil, err
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.cfg.Enabled || len(r.pool) == 0 {
+		return nil, nil
 	}
-	if ep == nil {
+	now := time.Now()
+	accountID = accountSlug(accountID)
+	a, ok := r.assign[accountID]
+	if !ok || !a.StickyUntil.After(now) {
+		return nil, nil
+	}
+	ep := r.byID[a.ProxyID]
+	if ep == nil || !r.healthyLocked(ep, now) {
 		return nil, nil
 	}
 	return ep.url, nil
 }
 
-func (r *proxyRouter) waitTurn(accountID, proxyID string) error {
-	for {
-		wait, err := r.nextWait(accountID, proxyID)
-		if err != nil {
-			return err
-		}
-		if wait <= 0 {
-			return nil
-		}
-		time.Sleep(wait)
+// proxyLeaseCtxKey marks a request whose paced RoundTrip already holds a lease,
+// so dialChromeTLS must not acquire a nested lease.
+type proxyLeaseCtxKey struct{}
+
+func contextWithProxyLease(ctx context.Context, proxyID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	if proxyID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, proxyLeaseCtxKey{}, proxyID)
 }
 
-func (r *proxyRouter) nextWait(accountID, proxyID string) (time.Duration, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.cfg.Enabled {
-		return 0, nil
+func proxyLeaseFromContext(ctx context.Context) (proxyID string, ok bool) {
+	if ctx == nil {
+		return "", false
 	}
-	now := time.Now()
+	id, ok := ctx.Value(proxyLeaseCtxKey{}).(string)
+	return id, ok && id != ""
+}
+
+// acquireLease picks a sticky proxy and reserves capacity under one lock so
+// concurrent RoundTrips cannot oversubscribe between wait and beginRequest.
+// Each loop re-calls pickProxyLocked after wait/wake so fresh soft-picks recompute.
+// Blocks (capped) when the endpoint is at RPM/concurrency/gap limits.
+// Honors ctx cancellation on every wait loop; never leaves inFlight reserved on cancel.
+func (r *proxyRouter) acquireLease(ctx context.Context, accountID string) (proxyID string, err error) {
+	const maxWait = 2 * time.Second
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	accountID = accountSlug(accountID)
-
-	if proxyID != "" {
-		rt := r.runtime(proxyID)
-		if rt.cooldownUntil.After(now) {
-			return rt.cooldownUntil.Sub(now), nil
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-		if rt.inFlight >= r.cfg.PerProxyMaxConcurrent {
-			return 250 * time.Millisecond, nil
+		r.mu.Lock()
+		if !r.cfg.Enabled || len(r.pool) == 0 {
+			r.mu.Unlock()
+			return "", nil
 		}
-		rt.recent = pruneRecent(rt.recent, now, time.Minute)
-		if len(rt.recent) >= r.cfg.PerProxyRPM {
-			return rt.recent[0].Add(time.Minute).Sub(now) + time.Duration(rand.Intn(400))*time.Millisecond, nil
+		ep := r.pickProxyLocked(accountID)
+		proxyID = ""
+		if ep != nil {
+			proxyID = ep.id
 		}
-		if !rt.lastReq.IsZero() {
-			gap := time.Duration(r.cfg.MinRequestGapMs) * time.Millisecond
-			if ready := rt.lastReq.Add(gap); ready.After(now) {
-				return ready.Sub(now), nil
-			}
+		wait := r.nextWaitLocked(accountID, proxyID)
+		if wait <= 0 {
+			r.beginRequestLocked(accountID, proxyID)
+			r.mu.Unlock()
+			return proxyID, nil
 		}
-	}
-
-	acc := r.accountRuntime(accountID)
-	acc.recent = pruneRecent(acc.recent, now, time.Minute)
-	if len(acc.recent) >= r.cfg.PerAccountRPM {
-		return acc.recent[0].Add(time.Minute).Sub(now) + time.Duration(rand.Intn(400))*time.Millisecond, nil
-	}
-	if !acc.lastReq.IsZero() {
-		gap := time.Duration(r.cfg.MinRequestGapMs) * time.Millisecond
-		if ready := acc.lastReq.Add(gap); ready.After(now) {
-			return ready.Sub(now), nil
+		r.mu.Unlock()
+		// Never park a request for minutes on cooldown — cap and re-check
+		// (reportResult will rotate/cooldown as needed).
+		if wait > maxWait {
+			wait = maxWait
+		}
+		if err := r.doSleep(ctx, wait); err != nil {
+			return "", err
 		}
 	}
-	return 0, nil
 }
 
-func (r *proxyRouter) beginRequest(accountID, proxyID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	now := time.Now()
-	if proxyID != "" {
-		rt := r.runtime(proxyID)
-		rt.inFlight++
-		rt.lastReq = now
-		rt.recent = append(pruneRecent(rt.recent, now, time.Minute), now)
-	}
-	acc := r.accountRuntime(accountSlug(accountID))
-	acc.lastReq = now
-	acc.recent = append(pruneRecent(acc.recent, now, time.Minute), now)
-}
-
-func (r *proxyRouter) endRequest(proxyID string) {
+func (r *proxyRouter) releaseLease(proxyID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if proxyID == "" {
@@ -522,6 +602,87 @@ func (r *proxyRouter) endRequest(proxyID string) {
 	if rt.inFlight > 0 {
 		rt.inFlight--
 	}
+}
+
+// nextWaitLocked must be called with r.mu held.
+func (r *proxyRouter) nextWaitLocked(accountID, proxyID string) time.Duration {
+	if !r.cfg.Enabled {
+		return 0
+	}
+	now := time.Now()
+	accountID = accountSlug(accountID)
+
+	if proxyID != "" {
+		rt := r.runtime(proxyID)
+		if rt.cooldownUntil.After(now) {
+			return rt.cooldownUntil.Sub(now)
+		}
+		if rt.inFlight >= r.cfg.PerProxyMaxConcurrent {
+			return 250 * time.Millisecond
+		}
+		rt.recent = pruneRecent(rt.recent, now, time.Minute)
+		if len(rt.recent) >= r.cfg.PerProxyRPM {
+			return rt.recent[0].Add(time.Minute).Sub(now) + time.Duration(rand.Intn(400))*time.Millisecond
+		}
+		if !rt.lastReq.IsZero() {
+			gap := time.Duration(r.cfg.MinRequestGapMs) * time.Millisecond
+			if ready := rt.lastReq.Add(gap); ready.After(now) {
+				return ready.Sub(now)
+			}
+		}
+	}
+
+	acc := r.accountRuntime(accountID)
+	acc.recent = pruneRecent(acc.recent, now, time.Minute)
+	if len(acc.recent) >= r.cfg.PerAccountRPM {
+		return acc.recent[0].Add(time.Minute).Sub(now) + time.Duration(rand.Intn(400))*time.Millisecond
+	}
+	if !acc.lastReq.IsZero() {
+		gap := time.Duration(r.cfg.MinRequestGapMs) * time.Millisecond
+		if ready := acc.lastReq.Add(gap); ready.After(now) {
+			return ready.Sub(now)
+		}
+	}
+	return 0
+}
+
+// beginRequestLocked must be called with r.mu held.
+// Sole commit point for fresh sticky state: writes r.assign under the same lock
+// hold as inFlight++ so cancel-before-lease never leaves a half-binding.
+func (r *proxyRouter) beginRequestLocked(accountID, proxyID string) {
+	now := time.Now()
+	accountID = accountSlug(accountID)
+	if proxyID != "" {
+		rt := r.runtime(proxyID)
+		rt.inFlight++
+		rt.lastReq = now
+		rt.recent = append(pruneRecent(rt.recent, now, time.Minute), now)
+		if a, ok := r.assign[accountID]; !ok || a.ProxyID != proxyID || !a.StickyUntil.After(now) {
+			r.assign[accountID] = proxyAssignment{
+				ProxyID:     proxyID,
+				StickyUntil: now.Add(time.Duration(r.cfg.StickyMinutes) * time.Minute),
+			}
+			r.freshBindCount++
+			r.saveStateLocked()
+		}
+	}
+	acc := r.accountRuntime(accountID)
+	acc.lastReq = now
+	acc.recent = append(pruneRecent(acc.recent, now, time.Minute), now)
+}
+
+// resetFreshBindCount clears the test-only fresh-bind counter.
+func (r *proxyRouter) resetFreshBindCount() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.freshBindCount = 0
+}
+
+// freshBinds returns how many true sticky commits beginRequestLocked made.
+func (r *proxyRouter) freshBinds() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.freshBindCount
 }
 
 func (r *proxyRouter) backoffDuration(failures int, retryAfter time.Duration) time.Duration {
@@ -577,15 +738,28 @@ func (r *proxyRouter) reportResult(accountID, proxyID string, status int, reqErr
 	if proxyID == "" || !r.cfg.Enabled {
 		return 0
 	}
+	accountID = accountSlug(accountID)
 	rt := r.runtime(proxyID)
 	retryAfter := parseRetryAfter(hdr)
+
+	// 403 is usually account/session scoped (CSRF soft-fail, email verify, etc).
+	// Break this account's sticky binding only — do not cool the shared proxy.
+	if reqErr == nil && status == http.StatusForbidden {
+		if a, ok := r.assign[accountID]; ok && a.ProxyID == proxyID {
+			delete(r.assign, accountID)
+			r.saveStateLocked()
+			fmt.Printf("proxy: account sticky cleared for %s after 403 (proxy %s stays warm)\n",
+				accountID, proxyLabel(r.byID[proxyID]))
+		}
+		return 0
+	}
 
 	cool := false
 	switch {
 	case reqErr != nil:
 		rt.failures++
 		cool = true
-	case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status == http.StatusForbidden:
+	case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
 		rt.failures++
 		cool = true
 	case status >= 500:
@@ -612,7 +786,7 @@ func (r *proxyRouter) reportResult(accountID, proxyID string, status int, reqErr
 	}
 	r.saveStateLocked()
 	fmt.Printf("proxy: cooldown %s for %s (account=%s status=%d failures=%d)\n",
-		proxyLabel(r.byID[proxyID]), wait.Round(time.Second), accountSlug(accountID), status, rt.failures)
+		proxyLabel(r.byID[proxyID]), wait.Round(time.Second), accountID, status, rt.failures)
 	return wait
 }
 
@@ -622,6 +796,10 @@ func proxyLabel(ep *proxyEndpoint) string {
 	}
 	return ep.label
 }
+
+// maxProxyRetries is the bounded retry budget for 429/503 after cooldown wait.
+// 403 is not retried here — callers handle CSRF refresh if needed.
+const maxProxyRetries = 2
 
 // pacedProxyTransport enforces respectful gaps / RPM caps and feeds results
 // back into the pool cooldown rules.
@@ -640,73 +818,69 @@ func (t *pacedProxyTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return base.RoundTrip(req)
 	}
 
-	ep, err := r.pickProxy(t.accountID)
-	if err != nil {
-		return nil, err
-	}
-	proxyID := ""
-	if ep != nil {
-		proxyID = ep.id
-	}
-	if err := r.waitTurn(t.accountID, proxyID); err != nil {
-		return nil, err
-	}
-	// Re-pick after wait in case cooldown reshuffled the pool.
-	ep, err = r.pickProxy(t.accountID)
-	if err != nil {
-		return nil, err
-	}
-	if ep != nil {
-		proxyID = ep.id
-	}
-
-	r.beginRequest(t.accountID, proxyID)
-	resp, reqErr := base.RoundTrip(req)
-	r.endRequest(proxyID)
-
-	status := 0
-	var hdr http.Header
-	if resp != nil {
-		status = resp.StatusCode
-		hdr = resp.Header
-	}
-	wait := r.reportResult(t.accountID, proxyID, status, reqErr, hdr)
-	canRetry := wait > 0 && resp != nil &&
-		(status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable) &&
-		(req.Body == nil || req.GetBody != nil)
-	if !canRetry {
-		return resp, reqErr
-	}
-	// One respectful retry after honoring Retry-After / backoff.
-	time.Sleep(wait)
-	retryReq := req.Clone(req.Context())
-	if req.GetBody != nil {
-		body, err := req.GetBody()
+	ctx := req.Context()
+	cur := req
+	var lastResp *http.Response
+	var lastErr error
+	for attempt := 0; attempt <= maxProxyRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		proxyID, err := r.acquireLease(ctx, t.accountID)
 		if err != nil {
+			return nil, err
+		}
+
+		// Panic-safe release around RoundTrip only; each retry re-acquires.
+		// Tag ctx so dialChromeTLS sees the outer lease and skips a nested one.
+		resp, reqErr := func() (resp *http.Response, err error) {
+			defer r.releaseLease(proxyID)
+			req := cur.WithContext(contextWithProxyLease(cur.Context(), proxyID))
+			return base.RoundTrip(req)
+		}()
+
+		status := 0
+		var hdr http.Header
+		if resp != nil {
+			status = resp.StatusCode
+			hdr = resp.Header
+		}
+		wait := r.reportResult(t.accountID, proxyID, status, reqErr, hdr)
+		canRetry := attempt < maxProxyRetries && wait > 0 &&
+			(status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable) &&
+			(cur.Body == nil || cur.GetBody != nil)
+		if !canRetry {
 			return resp, reqErr
 		}
-		retryReq.Body = body
+
+		// Always drain/close before sleep/retry (nil/partial responses included).
+		closeProxyResponseBody(resp)
+		lastResp, lastErr = resp, reqErr
+		if err := r.doSleep(ctx, wait); err != nil {
+			return lastResp, err
+		}
+
+		retryReq := cur.Clone(ctx)
+		if cur.GetBody != nil {
+			body, err := cur.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("proxy retry: recreate body: %w", err)
+			}
+			retryReq.Body = body
+		}
+		cur = retryReq
 	}
-	if err := r.waitTurn(t.accountID, ""); err != nil {
-		return resp, reqErr
+	return lastResp, lastErr
+}
+
+// closeProxyResponseBody drains and closes a response body when present.
+// Safe for nil resp / nil Body so retries never leak connections.
+func closeProxyResponseBody(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
 	}
-	ep2, _ := r.pickProxy(t.accountID)
-	proxyID2 := ""
-	if ep2 != nil {
-		proxyID2 = ep2.id
-	}
-	r.beginRequest(t.accountID, proxyID2)
-	resp2, err2 := base.RoundTrip(retryReq)
-	r.endRequest(proxyID2)
-	status2 := 0
-	var hdr2 http.Header
-	if resp2 != nil {
-		status2 = resp2.StatusCode
-		hdr2 = resp2.Header
-	}
-	r.reportResult(t.accountID, proxyID2, status2, err2, hdr2)
-	resp.Body.Close()
-	return resp2, err2
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
 }
 
 func wrapProxyPace(base http.RoundTripper, accountID string) http.RoundTripper {

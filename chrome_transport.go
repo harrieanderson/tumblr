@@ -154,6 +154,9 @@ func (t *chromeTransport) dialChromeTLS(ctx context.Context, addr string) (net.C
 	if err != nil {
 		return nil, err
 	}
+	if r.enabled() && proxyURL == nil {
+		return nil, fmt.Errorf("chrome transport: sticky proxy required for %s — refusing direct/home IP to %s", t.accountID, addr)
+	}
 
 	var raw net.Conn
 	if t.rawDial != nil {

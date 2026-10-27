@@ -175,17 +175,43 @@ func syncResearchFollowers(a Account, now time.Time) (added, lost int, err error
 	if accountIsTerminated(a.ID) {
 		return 0, 0, fmt.Errorf("terminated")
 	}
-	auth := peekAccountAuth(a.ID)
-	if !authHasSID(auth) {
-		return 0, 0, fmt.Errorf("no session")
+	// loadAuthFrom keeps proxy/CSRF/save on this account (peek leaves path empty).
+	auth, err := loadAuthFrom(accountAuthPath(a.ID))
+	if err != nil || !authHasSID(auth) {
+		auth = Auth{path: accountAuthPath(a.ID)}
+		if !headlessChrome {
+			client := newAuthClient(&auth)
+			if rec := recoverSession(client, &auth, true); rec != nil {
+				return 0, 0, fmt.Errorf("no session: %w", rec)
+			}
+		} else {
+			return 0, 0, fmt.Errorf("no session")
+		}
 	}
 	client := newAuthClient(&auth)
 	if err := refreshCSRF(client, &auth); err != nil {
-		return 0, 0, err
+		// Dead cookie — open Chrome, mint a new sid, then retry once.
+		if isCookieProblem(err) && !headlessChrome {
+			if rec := recoverSession(client, &auth, true); rec != nil {
+				return 0, 0, err
+			}
+			if err2 := refreshCSRF(client, &auth); err2 != nil {
+				return 0, 0, err2
+			}
+		} else {
+			return 0, 0, err
+		}
 	}
 	blogs, err := listAccountBlogsDetailed(client, auth)
 	if err != nil {
-		return 0, 0, err
+		if isCookieProblem(err) && !headlessChrome {
+			if rec := recoverSession(client, &auth, true); rec == nil {
+				blogs, err = listAccountBlogsDetailed(client, auth)
+			}
+		}
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 	var primary tumblrBlog
 	for _, b := range blogs {

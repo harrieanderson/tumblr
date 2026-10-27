@@ -15,12 +15,24 @@ const (
 	authExampleFile = "config/auth.example.json"
 )
 
+// Auth is the per-account session store. The Tumblr `sid` cookie remains the
+// credential; the extra fields are health metadata so recovery can preflight,
+// stay on the sticky proxy, and stop thrashing Chrome when a captcha needs a
+// human (`needsInteractiveLogin`).
 type Auth struct {
 	Cookie string `json:"cookie"`
 	Bearer string `json:"bearer"`
 	Blog   string `json:"blog"`
 	CSRF   string `json:"csrf"`
-	path   string `json:"-"`
+
+	// Session health (not alternate credentials).
+	ValidatedAt           string `json:"validatedAt,omitempty"`
+	ProxyID               string `json:"proxyId,omitempty"`
+	NeedsInteractiveLogin bool   `json:"needsInteractiveLogin,omitempty"`
+	RecoveryAttempts      int    `json:"recoveryAttempts,omitempty"`
+	LastRecoveryAt        string `json:"lastRecoveryAt,omitempty"`
+
+	path string `json:"-"`
 }
 
 func prepareWorkspace() error {
@@ -91,7 +103,20 @@ func saveAuth(auth Auth) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	// Atomic replace keeps auth.json readable on crash mid-write. Mode 0600 is
+	// the at-rest protection for the cookie (no alternate credential model).
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		// Windows: rename over existing can fail; fall back to truncate write.
+		if err2 := os.WriteFile(path, data, 0600); err2 != nil {
+			return err2
+		}
+	}
+	return nil
 }
 
 func maybeFillBlog(client *http.Client, auth *Auth) {
@@ -200,6 +225,7 @@ func refreshCSRF(client *http.Client, auth *Auth) error {
 			return fmt.Errorf("no X-CSRF header in counts response (cookie may be expired)")
 		}
 	}
+	markSessionValidated(auth)
 	return saveAuth(*auth)
 }
 
@@ -332,4 +358,8 @@ func clearAuthSession(auth *Auth) {
 	auth.Blog = ""
 	auth.CSRF = ""
 	auth.Bearer = ""
+	auth.ValidatedAt = ""
+	auth.ProxyID = ""
+	// Keep NeedsInteractiveLogin / RecoveryAttempts — caller decides whether
+	// a human login is still required after wiping a bad cookie.
 }

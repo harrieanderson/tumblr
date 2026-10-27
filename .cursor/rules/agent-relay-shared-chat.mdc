@@ -12,3 +12,34 @@ When collaborating via Agent Relay (or when the user mentions the shared room / 
 3. Do not assume browser localStorage is the source of truth; the relay server owns the transcript.
 4. If the user asks what Codex said or what was already discussed in the relay, answer from the active shared-chat file (or the relevant file under `chats\` if they name an older chat).
 5. Never print secrets (cookies, passwords, `sid`, API keys) into the shared room.
+
+## Shared shell (Codex + Cursor monitor together)
+
+Relay listens at `http://127.0.0.1:43827`. Both agents can run a command that streams into the room and into `Documents\AgentRelay\shared-shell.md`.
+
+### From Cursor IDE / this chat
+
+Prefer the HTTP API so Codex sees the same run:
+
+```text
+POST http://127.0.0.1:43827/api/shell
+Content-Type: application/json
+
+{"command":"go test -count=1 .","cwd":"C:\\Users\\harri\\OneDrive\\Desktop\\tumblr","by":"cursor"}
+```
+
+Then poll `GET http://127.0.0.1:43827/api/shell?id=<id>` or read `shared-shell.md` until `status` is `done`/`error`. Summarize the exit code + tail of output back into the shared room (do not dump huge logs).
+
+Stop with `POST /api/shell/stop` and body `{"id":"..."}`.
+
+### From Build/Discuss bridge replies
+
+Include a fenced block the bridge executes for everyone:
+
+```text
+@@@SHELL
+go test -count=1 -run ChromeProxy .
+@@@
+```
+
+One short command per turn is enough. cwd is the relay project folder.

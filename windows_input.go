@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -15,31 +16,65 @@ import (
 // move the mouse or send Enter to whatever window is in front.
 var nativeChromeClicks bool
 
+// osRecaptchaClickAllowed is the ONLY gate for physical mouse moves/clicks on
+// the Tumblr page. Set exclusively around reCAPTCHA "I'm not a robot" hits.
 var (
-	user32                       = syscall.NewLazyDLL("user32.dll")
-	procEnumWindows              = user32.NewProc("EnumWindows")
-	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
-	procGetWindowTextW           = user32.NewProc("GetWindowTextW")
-	procGetClassNameW            = user32.NewProc("GetClassNameW")
-	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
-	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
-	procShowWindow               = user32.NewProc("ShowWindow")
-	procBringWindowToTop         = user32.NewProc("BringWindowToTop")
-	procSetFocus                 = user32.NewProc("SetFocus")
-	procGetForegroundWindow      = user32.NewProc("GetForegroundWindow")
-	procGetCurrentThreadId       = syscall.NewLazyDLL("kernel32.dll").NewProc("GetCurrentThreadId")
-	procAttachThreadInput        = user32.NewProc("AttachThreadInput")
-	procKeybdEvent               = user32.NewProc("keybd_event")
-	procGetWindowRect            = user32.NewProc("GetWindowRect")
-	procGetCursorPos             = user32.NewProc("GetCursorPos")
-	procClientToScreen           = user32.NewProc("ClientToScreen")
-	procGetDpiForWindow          = user32.NewProc("GetDpiForWindow")
-	procSetCursorPos             = user32.NewProc("SetCursorPos")
-	procMouseEvent               = user32.NewProc("mouse_event")
-	procGetGUIThreadInfo         = user32.NewProc("GetGUIThreadInfo")
-	procSendMessageW             = user32.NewProc("SendMessageW")
-	procPostMessageW             = user32.NewProc("PostMessageW")
+	osRecaptchaClickMu      sync.Mutex
+	osRecaptchaClickAllowed bool
 )
+
+// withOSRecaptchaClick permits one physical page-click section for reCAPTCHA.
+// Every other caller of clickChromePageCSSForced / clickScreenXYForced is a no-op.
+func withOSRecaptchaClick(fn func()) {
+	osRecaptchaClickMu.Lock()
+	osRecaptchaClickAllowed = true
+	defer func() {
+		osRecaptchaClickAllowed = false
+		osRecaptchaClickMu.Unlock()
+	}()
+	fn()
+}
+
+var (
+	user32                            = syscall.NewLazyDLL("user32.dll")
+	procEnumWindows                   = user32.NewProc("EnumWindows")
+	procIsWindowVisible               = user32.NewProc("IsWindowVisible")
+	procGetWindowTextW                = user32.NewProc("GetWindowTextW")
+	procGetClassNameW                 = user32.NewProc("GetClassNameW")
+	procGetWindowThreadProcessId      = user32.NewProc("GetWindowThreadProcessId")
+	procSetForegroundWindow           = user32.NewProc("SetForegroundWindow")
+	procShowWindow                    = user32.NewProc("ShowWindow")
+	procBringWindowToTop              = user32.NewProc("BringWindowToTop")
+	procSetFocus                      = user32.NewProc("SetFocus")
+	procGetForegroundWindow           = user32.NewProc("GetForegroundWindow")
+	procGetCurrentThreadId            = kernel32.NewProc("GetCurrentThreadId")
+	procAttachThreadInput             = user32.NewProc("AttachThreadInput")
+	procKeybdEvent                    = user32.NewProc("keybd_event")
+	procGetWindowRect                 = user32.NewProc("GetWindowRect")
+	procGetClientRect                 = user32.NewProc("GetClientRect")
+	procGetCursorPos                  = user32.NewProc("GetCursorPos")
+	procClientToScreen                = user32.NewProc("ClientToScreen")
+	procGetDpiForWindow               = user32.NewProc("GetDpiForWindow")
+	procSetCursorPos                  = user32.NewProc("SetCursorPos")
+	procMouseEvent                    = user32.NewProc("mouse_event")
+	procGetGUIThreadInfo              = user32.NewProc("GetGUIThreadInfo")
+	procSendMessageW                  = user32.NewProc("SendMessageW")
+	procPostMessageW                  = user32.NewProc("PostMessageW")
+	procEnumChildWindows              = user32.NewProc("EnumChildWindows")
+	procCreateToolhelp32Snapshot      = kernel32.NewProc("CreateToolhelp32Snapshot")
+	procProcess32FirstW               = kernel32.NewProc("Process32FirstW")
+	procProcess32NextW                = kernel32.NewProc("Process32NextW")
+	procCloseHandle                   = kernel32.NewProc("CloseHandle")
+	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
+)
+
+func init() {
+	// Match Chrome's Per-Monitor DPI so ClientToScreen coords line up with
+	// SetCursorPos. Without this, captcha OS clicks land off the checkbox
+	// on scaled displays (Harrie's manual click works; ours miss).
+	const dpiAwarenessContextPerMonitorAwareV2 = ^uintptr(3) // (DPI_AWARENESS_CONTEXT)-4
+	_, _, _ = procSetProcessDpiAwarenessContext.Call(dpiAwarenessContextPerMonitorAwareV2)
+}
 
 type winInfo struct {
 	hwnd  uintptr
@@ -108,17 +143,75 @@ func findWindowContaining(titleSubstr string) uintptr {
 	return 0
 }
 
-// findMainWindowForPID finds the main Chrome_WidgetWin window for a browser pid.
+type processentry32W struct {
+	Size            uint32
+	CntUsage        uint32
+	ProcessID       uint32
+	DefaultHeapID   uintptr
+	ModuleID        uint32
+	CntThreads      uint32
+	ParentProcessID uint32
+	PriClassBase    int32
+	Flags           uint32
+	ExeFile         [260]uint16
+}
+
+// chromeProcessTreePIDs returns the launcher pid plus every descendant chrome.exe.
+// The visible WidgetWin lives on a child process, not cmd.Process.Pid.
+func chromeProcessTreePIDs(root uint32) map[uint32]bool {
+	out := map[uint32]bool{}
+	if root == 0 {
+		return out
+	}
+	out[root] = true
+	const th32csSnapProcess = 0x00000002
+	snap, _, _ := procCreateToolhelp32Snapshot.Call(th32csSnapProcess, 0)
+	if snap == 0 || snap == uintptr(syscall.InvalidHandle) {
+		return out
+	}
+	defer procCloseHandle.Call(snap)
+
+	var parentOf = map[uint32]uint32{}
+	var pe processentry32W
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	ok, _, _ := procProcess32FirstW.Call(snap, uintptr(unsafe.Pointer(&pe)))
+	for ok != 0 {
+		parentOf[pe.ProcessID] = pe.ParentProcessID
+		ok, _, _ = procProcess32NextW.Call(snap, uintptr(unsafe.Pointer(&pe)))
+	}
+	changed := true
+	for changed {
+		changed = false
+		for pid, parent := range parentOf {
+			if out[pid] {
+				continue
+			}
+			if out[parent] {
+				out[pid] = true
+				changed = true
+			}
+		}
+	}
+	return out
+}
+
+// findMainWindowForPID finds the main Chrome_WidgetWin for a browser pid
+// (or any process in that Chrome's process tree).
 func findMainWindowForPID(pid uint32) uintptr {
 	if pid == 0 {
 		return 0
 	}
-	bestHWND, bestTitled := uintptr(0), uintptr(0)
-	bestArea, bestTitledArea := -1, -1
+	tree := chromeProcessTreePIDs(pid)
+	bestHWND, bestTitled, bestTumblr := uintptr(0), uintptr(0), uintptr(0)
+	bestArea, bestTitledArea, bestTumblrArea := -1, -1, -1
 	cb := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
 		var got uint32
 		procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&got)))
-		if got != pid {
+		if !tree[got] {
+			return 1
+		}
+		vis, _, _ := procIsWindowVisible.Call(hwnd)
+		if vis == 0 {
 			return 1
 		}
 		title := windowText(hwnd)
@@ -140,9 +233,16 @@ func findMainWindowForPID(pid uint32) uintptr {
 			bestTitledArea = area
 			bestTitled = hwnd
 		}
+		if strings.Contains(strings.ToLower(title), "tumblr") && area > bestTumblrArea {
+			bestTumblrArea = area
+			bestTumblr = hwnd
+		}
 		return 1
 	})
 	procEnumWindows.Call(cb, 0)
+	if bestTumblr != 0 {
+		return bestTumblr
+	}
 	if bestTitled != 0 {
 		return bestTitled
 	}
@@ -151,12 +251,12 @@ func findMainWindowForPID(pid uint32) uintptr {
 
 func findChromeWindowForAccount(accountID string) uintptr {
 	accountID = accountSlug(accountID)
-	if accountID != "" && liveChromeAccount == accountID && liveChromePID > 0 {
-		return findMainWindowForPID(uint32(liveChromePID))
-	}
 	if liveChromePID > 0 {
-		return findMainWindowForPID(uint32(liveChromePID))
+		if hwnd := findMainWindowForPID(uint32(liveChromePID)); hwnd != 0 {
+			return hwnd
+		}
 	}
+	_ = accountID
 	return 0
 }
 
@@ -266,54 +366,155 @@ func attachToWindowThread(hwnd uintptr) func() {
 }
 
 func clickScreen(x, y int) {
+	// Ease the cursor onto the box — teleport+instant click is what Google
+	// ignores; Harrie's manual click works because the pointer is already there.
+	var cur struct{ X, Y int32 }
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&cur)))
+	steps := 8
+	for i := 1; i <= steps; i++ {
+		ix := int(cur.X) + (x-int(cur.X))*i/steps
+		iy := int(cur.Y) + (y-int(cur.Y))*i/steps
+		procSetCursorPos.Call(uintptr(ix), uintptr(iy))
+		time.Sleep(18 * time.Millisecond)
+	}
 	procSetCursorPos.Call(uintptr(x), uintptr(y))
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(220 * time.Millisecond)
 	procMouseEvent.Call(mouseeventfLeftDown, 0, 0, 0, 0)
+	time.Sleep(50 * time.Millisecond)
 	procMouseEvent.Call(mouseeventfLeftUp, 0, 0, 0, 0)
 }
 
 func clickScreenRestore(x, y int) {
-	var pt struct{ X, Y int32 }
-	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	// Do not yank the cursor away mid-click — captcha needs the pointer
+	// to stay on the box long enough for Google to accept it.
 	clickScreen(x, y)
-	time.Sleep(40 * time.Millisecond)
-	procSetCursorPos.Call(uintptr(pt.X), uintptr(pt.Y))
+	time.Sleep(180 * time.Millisecond)
 }
 
 func clickChromePageCSS(cssX, cssY float64) {
-	if !nativeChromeClicks || cssX < 1 || cssY < 1 {
+	// Physical page clicks are reCAPTCHA-only (see withOSRecaptchaClick).
+	_ = cssX
+	_ = cssY
+}
+
+// findChromeRenderHWND finds Chrome's page render widget under the main window.
+// CSS viewport coords map to this client's area — no guessed toolbar offset.
+func findChromeRenderHWND(top uintptr) uintptr {
+	if top == 0 {
+		return 0
+	}
+	best, bestArea := uintptr(0), -1
+	cb := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		class := windowClass(hwnd)
+		if !strings.Contains(class, "Chrome_RenderWidgetHostHWND") {
+			return 1
+		}
+		var r struct{ Left, Top, Right, Bottom int32 }
+		procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
+		area := int(r.Right-r.Left) * int(r.Bottom-r.Top)
+		if area > bestArea {
+			bestArea = area
+			best = hwnd
+		}
+		return 1
+	})
+	procEnumChildWindows.Call(top, cb, 0)
+	return best
+}
+
+// clickChromePageCSSForced clicks page CSS coords with a real OS mouse event.
+// HARD GATE: no-op unless inside withOSRecaptchaClick (I'm-not-a-robot only).
+//
+// Maps CSS → screen by measuring the render widget's client size vs the page
+// viewport (handles DPI + Chrome zoom better than GetDpiForWindow alone).
+func clickChromePageCSSForced(cssX, cssY float64) {
+	clickChromePageCSSForcedScaled(cssX, cssY, 0, 0)
+}
+
+// clickChromePageCSSForcedScaled maps CSS coords into the render widget.
+// viewportW/H (CSS px) calibrate against the HWND client size; pass 0 to fall
+// back to DPI scaling only.
+func clickChromePageCSSForcedScaled(cssX, cssY, viewportW, viewportH float64) {
+	if !osRecaptchaClickAllowed {
 		return
 	}
-	hwnd := findWindowContaining("Tumblr")
+	if cssX < 1 || cssY < 1 {
+		return
+	}
+	hwnd := findChromeWindowForAccount(liveChromeAccount)
+	if hwnd == 0 {
+		hwnd = findWindowContaining("Tumblr")
+	}
 	if hwnd == 0 {
 		return
 	}
-	var origin struct{ X, Y int32 }
-	procClientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&origin)))
-	dpi := uintptr(96)
-	if r, _, _ := procGetDpiForWindow.Call(hwnd); r != 0 {
-		dpi = r
+	procShowWindow.Call(hwnd, 9) // SW_RESTORE
+	procSetForegroundWindow.Call(hwnd)
+	time.Sleep(80 * time.Millisecond)
+	target := findChromeRenderHWND(hwnd)
+	if target == 0 {
+		target = hwnd
 	}
-	scale := float64(dpi) / 96
-	chromeUI := int(88 * scale)
-	clickScreen(int(origin.X)+int(cssX*scale), int(origin.Y)+chromeUI+int(cssY*scale))
+	var origin struct{ X, Y int32 }
+	procClientToScreen.Call(target, uintptr(unsafe.Pointer(&origin)))
+	var crect struct{ Left, Top, Right, Bottom int32 }
+	procGetClientRect.Call(target, uintptr(unsafe.Pointer(&crect)))
+	clientW := float64(crect.Right - crect.Left)
+	clientH := float64(crect.Bottom - crect.Top)
+	scaleX, scaleY := 1.0, 1.0
+	if viewportW > 50 && viewportH > 50 && clientW > 50 && clientH > 50 {
+		scaleX = clientW / viewportW
+		scaleY = clientH / viewportH
+	} else {
+		dpi := uintptr(96)
+		if r, _, _ := procGetDpiForWindow.Call(hwnd); r != 0 {
+			dpi = r
+		}
+		scaleX = float64(dpi) / 96
+		scaleY = scaleX
+	}
+	// If calibration collapsed to ~1 but the window is on a scaled display,
+	// prefer GetDpiForWindow so we don't click short of the checkbox.
+	if scaleX > 0.92 && scaleX < 1.08 {
+		if r, _, _ := procGetDpiForWindow.Call(hwnd); r != 0 && r != 96 {
+			dpr := float64(r) / 96
+			if dpr > 1.08 || dpr < 0.92 {
+				scaleX, scaleY = dpr, dpr
+			}
+		}
+	}
+	sx := int(origin.X) + int(cssX*scaleX+0.5)
+	sy := int(origin.Y) + int(cssY*scaleY+0.5)
+	fmt.Printf("OS captcha click at screen (%d,%d) css=(%.0f,%.0f) scale=(%.3f,%.3f) hwnd=%d\n", sx, sy, cssX, cssY, scaleX, scaleY, hwnd)
+	_ = os.Stdout.Sync()
+	clickScreenRestore(sx, sy)
+}
+
+// clickScreenXYForced clicks absolute screen pixels (from JS screenX/screenY math).
+// HARD GATE: no-op unless inside withOSRecaptchaClick (I'm-not-a-robot only).
+func clickScreenXYForced(screenX, screenY float64) {
+	if !osRecaptchaClickAllowed {
+		return
+	}
+	if screenX < 1 || screenY < 1 {
+		return
+	}
+	hwnd := findChromeWindowForAccount(liveChromeAccount)
+	if hwnd == 0 {
+		hwnd = findWindowContaining("Tumblr")
+	}
+	if hwnd != 0 {
+		procShowWindow.Call(hwnd, 9)
+		procSetForegroundWindow.Call(hwnd)
+		time.Sleep(60 * time.Millisecond)
+	}
+	clickScreenRestore(int(screenX+0.5), int(screenY+0.5))
 }
 
 func clickPasskeyPINField(hwnd uintptr) {
-	var r struct{ Left, Top, Right, Bottom int32 }
-	ok, _, _ := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
-	if ok == 0 {
-		return
-	}
-	w := int(r.Right - r.Left)
-	h := int(r.Bottom - r.Top)
-	if w < 200 || h < 200 {
-		return
-	}
-	// PIN box sits under "Enter your PIN". Stay above "I forgot my PIN".
-	x := int(r.Left) + w/2
-	y := int(r.Top) + int(float64(h)*0.56)
-	clickScreen(x, y)
+	// Do not move the physical mouse for AgeKey/PIN — Harrie types it.
+	// Focus is handled via SetFocus / SendMessage in sendPINToPasskey.
+	_ = hwnd
 }
 
 func sendCharTo(hwnd uintptr, ch rune) {

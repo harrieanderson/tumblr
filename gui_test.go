@@ -65,6 +65,15 @@ func TestGuiHTMLHasControls(t *testing.T) {
 			t.Fatalf("gui HTML missing %s", id)
 		}
 	}
+	if !strings.Contains(guiHTML, "/api/remove-accounts") {
+		t.Fatal("gui must call /api/remove-accounts")
+	}
+	if !strings.Contains(guiHTML, `class="btn-rm"`) {
+		t.Fatal("each account row should have a − remove control next to the checkbox")
+	}
+	if !strings.Contains(guiHTML, "Are you sure?") {
+		t.Fatal("remove must ask are you sure before deleting")
+	}
 	if !strings.Contains(guiHTML, "Zoey") {
 		t.Fatal("expected studio branding")
 	}

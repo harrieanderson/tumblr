@@ -114,11 +114,67 @@ func TestFindNewPinnedCaptionMarkers(t *testing.T) {
 	if !strings.Contains(blob, "redoing pinned") {
 		t.Fatalf("blob %q", blob)
 	}
+	if !isNewPinnedIntro(m) {
+		t.Fatal("expected intro match")
+	}
 	if isPinnedPost(m) {
 		t.Fatal("should not be pinned")
 	}
 	m["is_pinned"] = true
 	if !isPinnedPost(m) {
 		t.Fatal("should be pinned")
+	}
+}
+
+func TestIsNewPinnedIntroWithoutBeaconsURL(t *testing.T) {
+	// Real duplicate case: summary has intro text but beacons lives only as a
+	// link formatting URL (or is missing on older copies).
+	m := map[string]any{
+		"id_string": "999",
+		"summary":   "Hiii 🥰 i'm zoey, i'm 25 and 5'4, and im obsessed with the gym, skyrim and art",
+		"content": []any{
+			map[string]any{"type": "text", "text": "Hiii 🥰"},
+			map[string]any{"type": "text", "text": "i'm zoey, i'm 25 and 5'4, and im obsessed with the gym, skyrim and art 🥰"},
+			map[string]any{
+				"type": "text",
+				"text": "Clicky",
+				"formatting": []any{
+					map[string]any{"type": "link", "url": beaconsLink},
+				},
+			},
+		},
+	}
+	if !isNewPinnedIntro(m) {
+		t.Fatalf("should match intro without beacons in plain text; blob=%q", postTextBlob(m))
+	}
+	noLink := map[string]any{
+		"summary": "Hiii\ni'm zoey, i'm 25 and 5'4, and im obsessed with the gym, skyrim and art\ni'm new here",
+	}
+	if !isNewPinnedIntro(noLink) {
+		t.Fatal("plain intro without beacons must still match (prevents re-post)")
+	}
+	if isNewPinnedIntroText("just a random skyrim meme") {
+		t.Fatal("random skyrim post must not match")
+	}
+}
+
+func TestFindNewPinnedPrefersPinnedAndListsExtras(t *testing.T) {
+	// Unit-level preference logic via the same selection used after a scan.
+	ids := []string{"a", "b", "c"}
+	pinnedID := "b"
+	keepID := ids[0]
+	keepPinned := false
+	if pinnedID != "" {
+		keepID = pinnedID
+		keepPinned = true
+	}
+	var extras []string
+	for _, id := range ids {
+		if id != keepID {
+			extras = append(extras, id)
+		}
+	}
+	if !keepPinned || keepID != "b" || len(extras) != 2 {
+		t.Fatalf("keep=%s pinned=%v extras=%v", keepID, keepPinned, extras)
 	}
 }

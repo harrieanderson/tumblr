@@ -215,6 +215,10 @@ func runFollowLikersOnUntil(acc Account, maxFollows, likePosts int, until time.T
 		if runTrailReblogs(client, &auth, cfg, reblogged, files.ID, logFn) > 0 {
 			_ = saveStringSet(files.Reblogged, reblogged)
 		}
+		// Maybe one NSFW reblog per week (tracked in data/profiles/{id}/reblog-ledger.jsonl).
+		if maybeWeeklyNSFWReblog(client, &auth, cfg, reblogged, files.ID, logFn) {
+			_ = saveStringSet(files.Reblogged, reblogged)
+		}
 	}
 
 	accLog(files.ID, logFn, "Done. Followed %d (%d skipped). Shared interacted: %d", n, skipped, interactedCount())
@@ -365,19 +369,7 @@ func loadFollowConfig() FollowConfig {
 		}
 		cfg.TrailReblog.Enabled = true
 	}
-	if cfg.NSFWReblog.MaxCount == 0 && cfg.NSFWReblog.WindowHours == 0 && cfg.NSFWReblog.Chance == 0 {
-		cfg.NSFWReblog = defaultNSFWReblogConfig()
-	} else {
-		if cfg.NSFWReblog.WindowHours <= 0 {
-			cfg.NSFWReblog.WindowHours = 72
-		}
-		if cfg.NSFWReblog.MaxCount < 0 {
-			cfg.NSFWReblog.MaxCount = 0
-		}
-		if cfg.NSFWReblog.Chance < 0 {
-			cfg.NSFWReblog.Chance = 0
-		}
-	}
+	cfg.NSFWReblog = nsfwReblogCfgOrDefault(cfg.NSFWReblog)
 	return cfg
 }
 
@@ -609,8 +601,8 @@ func engagePostsLikers(client *http.Client, auth *Auth, cfg FollowConfig, posts 
 			}
 			humanPause(12, 28)
 
-			// Public trail stays soft. Engager reblogs are rare NSFW only
-			// (tracked per-account over nsfwReblog.windowHours).
+			// Public trail stays soft. Engager NSFW reblogs share the weekly quota
+			// (max 1 / windowHours, chance-gated) with maybeWeeklyNSFWReblog.
 			allowEngagerReblog := cfg.ReblogEngagerPosts != nil && *cfg.ReblogEngagerPosts
 			if allowEngagerReblog || cfg.ReblogTheirPosts > 0 || cfg.NSFWReblog.MaxCount > 0 || cfg.NSFWReblog.Chance > 0 {
 				if maybeReblogEngagerPost(client, auth, cfg, blog, reblogged, id, logFn) {

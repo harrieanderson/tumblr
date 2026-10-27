@@ -57,20 +57,28 @@ type guiServer struct {
 	hub    *logHub
 	mu     sync.Mutex
 	openMu sync.Mutex
+	stopMu sync.Mutex
 	busy   bool
+	job    string
+	workers int
+	stop   bool
+	locks  *profileLocks
 }
 
 func runGUI() {
 	keepMachineAwake()
-	srv := &guiServer{hub: newLogHub()}
+	srv := &guiServer{hub: newLogHub(), locks: newProfileLocks(), workers: guiDefaultWorkers}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/api/events", srv.handleEvents)
 	mux.HandleFunc("/api/status", srv.handleStatus)
+	mux.HandleFunc("/api/stop", srv.handleStop)
+	mux.HandleFunc("/api/recover", srv.handleRecover)
 	mux.HandleFunc("/api/headless", srv.handleHeadless)
 	mux.HandleFunc("/api/accounts", srv.handleAccounts)
 	mux.HandleFunc("/api/login", srv.handleLogin)
+	mux.HandleFunc("/api/remove-accounts", srv.handleRemoveAccounts)
 	mux.HandleFunc("/api/follow", srv.handleFollow)
 	mux.HandleFunc("/api/reach-mid-replies", srv.handleReachMidReplies)
 	mux.HandleFunc("/api/research", srv.handleResearch)
@@ -152,21 +160,70 @@ func (s *guiServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *guiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	busy := s.busy
-	s.mu.Unlock()
 	selected := ""
 	if acc, ok := currentAccount(); ok {
 		selected = acc.ID
 	}
 	accs, tally := publicAccountsWithTally()
-	writeJSON(w, map[string]any{
-		"busy":     busy,
-		"selected": selected,
-		"accounts": accs,
-		"tally":    tally,
-		"headless": headlessChrome,
-	})
+	out := s.controlSnapshot()
+	out["selected"] = selected
+	out["accounts"] = accs
+	out["tally"] = tally
+	out["headless"] = headlessChrome
+	writeJSON(w, out)
+}
+
+func (s *guiServer) handleStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	s.requestStop()
+	writeJSON(w, map[string]any{"ok": true, "stop": true})
+}
+
+func (s *guiServer) handleRecover(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var body struct {
+		AccountID  string   `json:"accountId"`
+		AccountIDs []string `json:"accountIds"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	accs, err := guiAccounts(body.AccountID, body.AccountIDs)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	// Prefer accounts that need a human (captcha/flagged) or have no sid.
+	var need []Account
+	for _, a := range accs {
+		if a.ID == "" {
+			continue
+		}
+		auth := peekAccountAuth(a.ID)
+		if auth.NeedsInteractiveLogin || !authHasSID(auth) {
+			need = append(need, a)
+		}
+	}
+	if len(need) == 0 {
+		need = accs
+	}
+	label := fmt.Sprintf("recover %d accounts", len(need))
+	if len(need) == 1 {
+		label = "recover " + need[0].ID
+	}
+	if !s.tryStart(label) {
+		http.Error(w, "busy", 409)
+		return
+	}
+	go func() {
+		s.hub.broadcast("Recovery opens real Chrome per profile (no iframe). Passwords stay in credentials.json.")
+		s.done(guiLoginAccounts(s.hub, need, s.stopRequested, s.locks, s.currentJob()))
+	}()
+	writeJSON(w, map[string]any{"ok": true, "count": len(need)})
 }
 
 func (s *guiServer) handleHeadless(w http.ResponseWriter, r *http.Request) {
@@ -281,6 +338,13 @@ func (s *guiServer) runReachOnUntil(accs []Account, parallel, maxFollows, likePo
 	s.hub.broadcast(fmt.Sprintf("Reach on %d accounts: %d batches of %d, about %s each", len(accs), batches, parallel, slice.Round(time.Minute)))
 	var first error
 	for b := 0; b < batches; b++ {
+		if s.stopRequested() {
+			s.hub.broadcast("Stopped — remaining reach batches skipped.")
+			if first == nil {
+				first = fmt.Errorf("emergency stop")
+			}
+			return first
+		}
 		if !time.Now().Before(until) || sessionExpired() {
 			s.hub.broadcast(fmt.Sprintf("Time up after %d/%d batches — next pass starts with the rest.", b, batches))
 			break
@@ -320,8 +384,19 @@ func (s *guiServer) runReachOnAll(accs []Account, parallel, maxFollows, likePost
 		reachShardPool = nil
 		reachLikerShards = 0
 	}()
+	parallel = clampGUIWorkers(parallel)
 	s.hub.broadcast(fmt.Sprintf("Reach on %d selected accounts, %d at a time", len(accs), parallel))
+	job := s.currentJob()
 	fn := func(a Account) error {
+		if s.stopRequested() {
+			return fmt.Errorf("emergency stop")
+		}
+		if s.locks != nil {
+			if err := s.locks.tryLock(a.ID, job); err != nil {
+				return err
+			}
+			defer s.locks.unlock(a.ID)
+		}
 		return runFollowLikersOnUntil(a, maxFollows, likePosts, until, s.hub.broadcast)
 	}
 	if parallel >= len(accs) {
@@ -342,12 +417,31 @@ func (s *guiServer) forAccountsFiltered(accs []Account, uniqueBlogs bool, fn fun
 	var first error
 	seen := map[string]string{}
 	for _, a := range accs {
+		if s.stopRequested() {
+			s.hub.broadcast("Stopped — remaining accounts skipped.")
+			if first == nil {
+				first = fmt.Errorf("emergency stop")
+			}
+			return first
+		}
 		if a.ID != "" {
 			if len(accs) > 1 {
 				s.hub.broadcast("—— " + a.ID + " (" + a.Email + ") ——")
 			}
+			if s.locks != nil {
+				if err := s.locks.tryLock(a.ID, s.currentJob()); err != nil {
+					s.hub.broadcast(err.Error())
+					if first == nil {
+						first = err
+					}
+					continue
+				}
+			}
 			if _, ok := findAccount(a.ID); ok {
 				if err := setActiveAccount(a.ID); err != nil {
+					if s.locks != nil {
+						s.locks.unlock(a.ID)
+					}
 					s.hub.broadcast(err.Error())
 					if first == nil {
 						first = err
@@ -359,6 +453,9 @@ func (s *guiServer) forAccountsFiltered(accs []Account, uniqueBlogs bool, fn fun
 		if uniqueBlogs && len(accs) > 1 {
 			id, err := currentTumblrIdentity()
 			if err != nil {
+				if s.locks != nil {
+					s.locks.unlock(a.ID)
+				}
 				s.hub.broadcast("Failed on " + a.ID + ": " + err.Error())
 				if first == nil {
 					first = err
@@ -366,12 +463,19 @@ func (s *guiServer) forAccountsFiltered(accs []Account, uniqueBlogs bool, fn fun
 				continue
 			}
 			if prev, ok := seen[id]; ok {
+				if s.locks != nil {
+					s.locks.unlock(a.ID)
+				}
 				s.hub.broadcast("Skip " + a.ID + " — same Tumblr as " + prev + " (@" + id + ")")
 				continue
 			}
 			seen[id] = a.ID
 		}
-		if err := fn(); err != nil {
+		err := fn()
+		if s.locks != nil {
+			s.locks.unlock(a.ID)
+		}
+		if err != nil {
 			label := a.ID
 			if label == "" {
 				label = "account"
@@ -451,9 +555,46 @@ func (s *guiServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		s.hub.broadcast("Chrome will open once per selected profile.")
-		s.done(guiLoginAccounts(s.hub, accs))
+		s.done(guiLoginAccounts(s.hub, accs, s.stopRequested, s.locks, s.currentJob()))
 	}()
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *guiServer) handleRemoveAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var body struct {
+		AccountID  string   `json:"accountId"`
+		AccountIDs []string `json:"accountIds"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	accs, err := guiAccounts(body.AccountID, body.AccountIDs)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if len(accs) == 0 {
+		http.Error(w, "no accounts selected", 400)
+		return
+	}
+	removed := make([]string, 0, len(accs))
+	for _, a := range accs {
+		email, err := removeProfileByID(a.ID)
+		if err != nil {
+			s.hub.broadcast("Could not remove " + a.ID + ": " + err.Error())
+			continue
+		}
+		removed = append(removed, a.ID)
+		s.hub.broadcast("Removed " + a.ID + " (" + email + ") from credentials.")
+	}
+	if len(removed) == 0 {
+		http.Error(w, "nothing removed", 400)
+		return
+	}
+	accList, tally := publicAccountsWithTally()
+	writeJSON(w, map[string]any{"ok": true, "removed": removed, "accounts": accList, "tally": tally})
 }
 
 func (s *guiServer) handleOpenChrome(w http.ResponseWriter, r *http.Request) {
@@ -471,9 +612,18 @@ func (s *guiServer) handleOpenChrome(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	if s.locks != nil {
+		if err := s.locks.tryLock(acc.ID, "open-chrome"); err != nil {
+			http.Error(w, err.Error(), 409)
+			return
+		}
+	}
 	writeJSON(w, map[string]any{"ok": true})
 	s.hub.broadcast("Opening Chrome for " + acc.ID + "…")
 	go func() {
+		if s.locks != nil {
+			defer s.locks.unlock(acc.ID)
+		}
 		s.openMu.Lock()
 		defer s.openMu.Unlock()
 		if err := guiOpenAccountChrome(s.hub, acc); err != nil {
@@ -490,20 +640,47 @@ func (s *guiServer) tryStart(name string) bool {
 		return false
 	}
 	s.busy = true
+	s.job = name
+	s.workers = guiDefaultWorkers
+	s.clearStop()
 	clearSessionUntil()
 	s.hub.broadcast("Starting: " + name)
 	return true
 }
 
+func (s *guiServer) tryStartWorkers(name string, workers int) bool {
+	if !s.tryStart(name) {
+		return false
+	}
+	s.mu.Lock()
+	s.workers = clampGUIWorkers(workers)
+	s.mu.Unlock()
+	return true
+}
+
+func (s *guiServer) currentJob() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.job
+}
+
 func (s *guiServer) done(err error) {
+	stopped := s.stopRequested()
 	if err != nil {
 		s.hub.broadcast("Error: " + err.Error())
+	} else if stopped {
+		s.hub.broadcast("Stopped.")
 	} else {
 		s.hub.broadcast("Done.")
 	}
+	if s.locks != nil {
+		s.locks.unlockAll()
+	}
 	s.mu.Lock()
 	s.busy = false
+	s.job = ""
 	s.mu.Unlock()
+	s.clearStop()
 }
 
 func (s *guiServer) handleFollow(w http.ResponseWriter, r *http.Request) {
@@ -535,11 +712,12 @@ func (s *guiServer) handleFollow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accs = orderAccountsForReach(accs, false)
-	label := fmt.Sprintf("reach %d accounts, follow %d + like %d", len(accs), body.MaxFollows, body.LikePosts)
+	workers := clampGUIWorkers(body.Parallel)
+	label := fmt.Sprintf("reach %d accounts, follow %d + like %d (workers=%d)", len(accs), body.MaxFollows, body.LikePosts, workers)
 	if body.Minutes > 0 {
 		label = fmt.Sprintf("%s for %d min", label, body.Minutes)
 	}
-	if !s.tryStart(label) {
+	if !s.tryStartWorkers(label, workers) {
 		http.Error(w, "busy", 409)
 		return
 	}
@@ -550,12 +728,15 @@ func (s *guiServer) handleFollow(w http.ResponseWriter, r *http.Request) {
 		}
 		pass := 0
 		runPass := func() error {
+			if s.stopRequested() {
+				return fmt.Errorf("emergency stop")
+			}
 			run := rotateAccountSlice(accs, pass)
 			pass++
-			return s.runReachOnUntil(run, body.Parallel, body.MaxFollows, body.LikePosts, sessionUntil)
+			return s.runReachOnUntil(run, workers, body.MaxFollows, body.LikePosts, sessionUntil)
 		}
 		err := runPass()
-		for body.Minutes > 0 && !sessionExpired() {
+		for body.Minutes > 0 && !sessionExpired() && !s.stopRequested() {
 			if sessionRemaining() < 2*time.Minute {
 				s.hub.broadcast("Less than 2 minutes left — not starting another pass.")
 				break
@@ -683,18 +864,19 @@ func (s *guiServer) handleReachMidReplies(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	workers := clampGUIWorkers(body.Parallel)
 	if body.All {
-		label := fmt.Sprintf("reach + replies on all %d accounts for %d min", len(accs), body.Minutes)
-		if !s.tryStart(label) {
+		label := fmt.Sprintf("reach + replies on all %d accounts for %d min (workers=%d)", len(accs), body.Minutes, workers)
+		if !s.tryStartWorkers(label, workers) {
 			http.Error(w, "busy", 409)
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true})
-		go s.runReachAndRepliesAll(accs, body.Minutes, body.Parallel, body.MaxFollows, body.LikePosts, body.DryRun)
+		go s.runReachAndRepliesAll(accs, body.Minutes, workers, body.MaxFollows, body.LikePosts, body.DryRun)
 		return
 	}
 	label := fmt.Sprintf("reach + %d busiest inboxes for %d min / %.0fh watch", body.MidCount, body.Minutes, body.WatchHours)
-	if !s.tryStart(label) {
+	if !s.tryStartWorkers(label, workers) {
 		http.Error(w, "busy", 409)
 		return
 	}
@@ -1200,7 +1382,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func openBrowser(url string) error {
-	return exec.Command("cmd", "/c", "start", "", url).Start()
+	// Do NOT use `cmd /c start "" url` — Windows shows:
+	//   Windows cannot find '\" "'
+	// when the empty title arg gets mangled. rundll32 is reliable.
+	return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 }
 
 func guiOpenBrowser() bool {

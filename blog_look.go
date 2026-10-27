@@ -658,9 +658,10 @@ func chromeBlogLookStatusJS(accent, background, wantUser string) string {
 			const r = img.getBoundingClientRect();
 			if (r.width > 220 && r.height > 70 && r.top < 520) add(img.currentSrc || img.src);
 		}
-		// media.tumblr.com = persisted; blob = just-uploaded crop still open. Both count
-		// as progress. Solid black with no url must NOT count (that was the false ok).
-		const bannerOK = !!header && (/media\.tumblr\.com/i.test(header) || /^blob:/i.test(header)) && !/default_header/i.test(header);
+		// Only a persisted media.tumblr.com header counts as bannerOK for skip
+		// decisions. blob: is an in-progress crop — treating it as done skipped
+		// the real upload on the next pass.
+		const bannerOK = !!header && /media\.tumblr\.com/i.test(header) && !/default_header/i.test(header);
 		const href = (location.pathname || '').toLowerCase();
 		const userOK = !!(wantUser && href.indexOf('/settings/blog/' + wantUser) >= 0);
 		return {
@@ -1245,38 +1246,75 @@ func applyBlogLookParts(name string, cfg profileSetupConfig, doTheme bool) error
 		return skipBlogLook("Could not open blog settings")
 	}
 	themeOK := !doTheme
+	bannerAlready := false
+	colorsAlready := false
 	if doTheme {
+		// Appearance must be open or page swatches/header read as missing and we
+		// re-upload the banner forever. Open once, then decide what is left.
+		dismissOverlaysOnPort()
+		_ = withChromeTargetCDPFor(t, 20*time.Second, func(call cdpCall) error {
+			return cdpEnsureEditAppearance(call)
+		})
+		time.Sleep(400 * time.Millisecond)
+		page := readBlogLookStatus(t, cfg, "")
+		var api blogLookPageStatus
+		haveAPI := false
 		if p, err := fetchBlogProfile(newHumanClient(), auth, name); err == nil {
-			if st := savedThemeStatus(p, cfg); st.BannerOK && st.AccentOK && st.BackgroundOK {
-				fmt.Println("Banner and colours already saved — skipping them.")
-				themeOK = true
-			}
+			api = savedThemeStatus(p, cfg)
+			haveAPI = true
+		}
+		// Skip re-upload only when we previously applied Zoey banner AND Tumblr
+		// still shows a persisted media.tumblr.com header (not blob / random art).
+		persistedBanner := (page.BannerOK && bannerURLPersisted(page.Header)) || (haveAPI && api.BannerOK)
+		bannerAlready = persistedBanner && lookBannerAppliedByUs()
+		colorsAlready = page.colorsOK()
+		if !colorsAlready && haveAPI && api.colorsOK() && page.Accent == "" && page.Background == "" {
+			// Editor open but swatches not in DOM yet — trust API rather than re-click.
+			colorsAlready = true
+		}
+		if persistedBanner && !lookBannerAppliedByUs() {
+			fmt.Println("Banner URL exists but not recorded as ours — uploading Zoey banner.")
+		}
+		if bannerAlready && colorsAlready {
+			fmt.Println("Banner and colours already saved — skipping them.")
+			themeOK = true
+		} else if bannerAlready && !colorsAlready {
+			fmt.Println("Banner already set by us — applying colours only (not re-uploading header).")
+		} else if !bannerAlready && colorsAlready {
+			fmt.Println("Colours already set — uploading banner.")
 		}
 	}
 	colorsApplied := false
-	headerUploaded := false
+	themeTouched := false
+	uploadedHeader := false
 	if doTheme && !themeOK {
+		headerPath := header
+		if bannerAlready {
+			headerPath = "" // never re-upload a banner we already applied
+		}
 		dismissOverlaysOnPort()
-		if err := applyBlogThemeOnTarget(t, cfg, header); err != nil {
+		if err := applyBlogThemeOnTarget(t, cfg, headerPath); err != nil {
 			fmt.Println("Theme:", err)
 			// One retry only when the header editor never opened — not a second upload
 			// after a successful set (that was double-applying the background).
-			if strings.Contains(err.Error(), "chooser did not open") || strings.Contains(err.Error(), "button not found") {
+			if headerPath != "" && (strings.Contains(err.Error(), "chooser did not open") || strings.Contains(err.Error(), "button not found")) {
 				fmt.Println("Banner editor missing — one reopen retry, then move on if blocked.")
 				if nt, err2 := openBlogSettingsTab(name); err2 == nil {
 					t = nt
 				}
 				dismissOverlaysOnPort()
-				if err2 := applyBlogThemeOnTarget(t, cfg, header); err2 != nil {
+				if err2 := applyBlogThemeOnTarget(t, cfg, headerPath); err2 != nil {
 					fmt.Println("Theme retry:", err2)
 				} else {
-					headerUploaded = true
+					themeTouched = true
+					uploadedHeader = headerPath != ""
 				}
 			}
 		} else {
-			headerUploaded = true
+			themeTouched = true
+			uploadedHeader = headerPath != ""
 		}
-		if headerUploaded {
+		if themeTouched {
 			dismissOverlaysOnPort()
 			if err := clickAppearanceSaveOnTarget(t); err != nil {
 				fmt.Println("Save:", err)
@@ -1286,7 +1324,26 @@ func applyBlogLookParts(name string, cfg profileSetupConfig, doTheme bool) error
 				st := readBlogLookStatus(t, cfg, "")
 				fmt.Printf("Look check (page): accent=%s background=%s banner=%s header=%s\n",
 					setupFlag(st.AccentOK), setupFlag(st.BackgroundOK), setupFlag(st.BannerOK), st.Header)
-				// Trust a successful upload+save — never upload the banner a second time.
+				if uploadedHeader && (st.BannerOK || bannerURLPersisted(st.Header)) {
+					markLookBannerApplied(name)
+					bannerAlready = true
+				} else if st.BannerOK && bannerURLPersisted(st.Header) && lookBannerAppliedByUs() {
+					bannerAlready = true
+				}
+				if !st.colorsOK() {
+					fmt.Println("Colours not sticky after save — re-applying swatches only (not the banner).")
+					dismissOverlaysOnPort()
+					if err := applyBlogThemeOnTarget(t, cfg, ""); err != nil {
+						fmt.Println("Colour re-apply:", err)
+					} else if err := clickAppearanceSaveOnTarget(t); err != nil {
+						fmt.Println("Colour save:", err)
+					} else {
+						time.Sleep(500 * time.Millisecond)
+						st = readBlogLookStatus(t, cfg, "")
+						fmt.Printf("Look check (page, colours): accent=%s background=%s banner=%s\n",
+							setupFlag(st.AccentOK), setupFlag(st.BackgroundOK), setupFlag(st.BannerOK))
+					}
+				}
 				themeOK = true
 			}
 		}

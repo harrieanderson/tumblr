@@ -51,6 +51,11 @@ var (
 	liveTargetID       target.ID
 	liveChromeAccount  string
 	liveChromePID      int
+	liveChromeProxyID  string // sticky proxy id used for this Chrome process (Watch/login)
+	// forceProxySessionBind requests one fresh Tumblr sign-in while Chrome is on
+	// the sticky proxy so Active Sessions shows the proxy IP. Watch/Login set this;
+	// batch -setup-profile does not (avoids captcha on every account).
+	forceProxySessionBind bool
 	chromeLoginMu      sync.Mutex
 	skipChromeRecovery bool
 	// headlessCookieOnly: recover sessions by scraping the Chrome profile
@@ -222,6 +227,7 @@ func stopChromeOpts(cmd *exec.Cmd, polite bool) {
 	liveDebugPort = ""
 	liveChromeAccount = ""
 	liveChromePID = 0
+	liveChromeProxyID = ""
 	if runtime.GOOS == "windows" {
 		if pid > 0 {
 			_ = exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/T", "/F").Run()
@@ -247,6 +253,7 @@ func ensureFreshChromeForAccount(id string) {
 		liveDebugPort = ""
 		liveChromeAccount = ""
 		liveChromePID = 0
+		liveChromeProxyID = ""
 	}
 	preferred := debugPortForAccount(id)
 	killListenersOnPort(preferred)
@@ -449,10 +456,15 @@ func loginChromeSession(auth *Auth, forceForm bool) error {
 		return fmt.Errorf("Tumblr rejected %s's login at %s — not retrying automatically for 24h (run: tumblr.exe -login -account %s)", id, at.Format("15:04"), id)
 	}
 
-	// Tumblr answers hidden-Chrome logins with "incorrect password" even when
-	// the password is right, and then rejects a quick retry too — so logins
-	// always use a visible window, even when everything else runs headless.
-	cmd, err := startChromeLoggedInOpts(auth, forceForm, true)
+	// Hide Chrome / gaming: never force a real window. Headless also skips
+	// forceProxySessionBind — that path logs out and re-fills the form, which
+	// always hits captcha we can't solve. Prefer syncing an existing Chrome sid.
+	prevBind := forceProxySessionBind
+	if !headlessChrome {
+		forceProxySessionBind = true
+	}
+	defer func() { forceProxySessionBind = prevBind }()
+	cmd, err := startChromeLoggedInOpts(auth, forceForm, !headlessChrome)
 	if err != nil {
 		if cmd != nil {
 			stopChrome(cmd)
@@ -488,7 +500,11 @@ func loginWithRealChromeKeepOpen(auth *Auth) (stop func(), err error) {
 	nativeChromeClicks = false
 	defer func() { nativeChromeClicks = prevClicks }()
 
-	cmd, err := startChromeLoggedInOpts(auth, false, true)
+	prevBind := forceProxySessionBind
+	forceProxySessionBind = true
+	defer func() { forceProxySessionBind = prevBind }()
+	// Respect Hide Chrome — keep-open is for Watch; headless still hides the window.
+	cmd, err := startChromeLoggedInOpts(auth, false, !headlessChrome)
 	if err != nil {
 		if cmd != nil {
 			stopChrome(cmd)
@@ -546,10 +562,41 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 	creds, credErr := loadCredentialsFor(auth)
 	auto := credErr == nil
 	ensureFreshChromeForAccount(id)
+
+	// Sticky proxy for this account's Chrome (Watch, login, setup, reach recovery).
+	// Same exit IP as paced API traffic; local auth bridge injects credentials so
+	// Chrome never sees a proxy Sign-in dialog (creds stay off argv).
+	proxyLaunch, proxyErr := prepareChromeProxyLaunch(context.Background(), id, dir)
+	if proxyErr != nil {
+		return nil, fmt.Errorf("sticky proxy for Chrome: %w", proxyErr)
+	}
+	if err := requireChromeProxyLaunch(proxyLaunch); err != nil {
+		return nil, err
+	}
+	// Tumblr "Active Sessions" records the IP at login time. Watch/Login may force
+	// one fresh sign-in through the sticky proxy; setup batches keep the sid and
+	// still route Chrome via the proxy (no captcha storm).
+	forcedProxyLogin := forceProxySessionBind && proxyLaunch != nil && !chromeProxySessionBound(id)
+	if forcedProxyLogin {
+		forceForm = true
+		fmt.Println("Forcing fresh Tumblr login via sticky proxy so Active Sessions shows the proxy IP (not a prior home-UK session)…")
+	}
+	proxyOwned := false
+	loginOK := false
+	defer func() {
+		if !proxyOwned && proxyLaunch != nil && proxyLaunch.stop != nil {
+			proxyLaunch.stop()
+		}
+		if loginOK && proxyLaunch != nil {
+			markChromeProxySessionBound(id, proxyLaunch.ProxyID)
+		}
+	}()
+
 	preferred := debugPortForAccount(id)
 	port := pickFreeDebugPort(preferred)
 	liveDebugPort = port
 	liveChromeAccount = id
+	liveChromeProxyID = ""
 
 	if creds.Email != "" {
 		fmt.Println("Account:", id, "("+creds.Email+")")
@@ -560,6 +607,9 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 	fmt.Println("Debug port:", port)
 	if port != preferred {
 		fmt.Println("Port", preferred, "was already in use — using", port, "so we do not attach to another Chrome.")
+	}
+	if proxyLaunch != nil {
+		fmt.Println("Chrome proxy:", proxyLaunch.LogLabel, "("+proxyLaunch.ProxyID+") via local auth bridge")
 	}
 	fmt.Println()
 	if auto {
@@ -584,6 +634,7 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 	if hidden {
 		fmt.Println("Headless — Chrome stays hidden (captchas can't be solved in this mode).")
 	}
+
 	args := []string{
 		"--user-data-dir=" + dir,
 		"--remote-debugging-port=" + port,
@@ -615,6 +666,10 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		"--media-cache-size=8388608",
 		"--js-flags=--max-old-space-size=384",
 	}
+	args = mergeChromeProxyArgs(args, proxyLaunch)
+	if proxyLaunch != nil {
+		args = append(args, chromeWebRTCProxyArgs()...)
+	}
 	fp := fingerprint()
 	args = append(args, fp.langArg())
 	if hidden {
@@ -630,7 +685,16 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		liveDebugPort = ""
 		liveChromeAccount = ""
 		liveChromePID = 0
+		liveChromeProxyID = ""
 		return nil, err
+	}
+	if proxyLaunch != nil {
+		liveChromeProxyID = proxyLaunch.ProxyID
+		setLiveChromeProxyStop(proxyLaunch.stop)
+		proxyOwned = true
+	} else {
+		liveChromeProxyID = ""
+		stopLiveChromeProxy()
 	}
 	if cmd.Process != nil {
 		liveChromePID = cmd.Process.Pid
@@ -700,11 +764,35 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		}
 	}
 
-	// Fast path: dashboard already up — don't stall on CDP cookie scrape,
-	// saveAuth guards, or proxy CSRF. Setup drives Tumblr through Chrome.
-	if chromeLooksLoggedIn() {
+	// Always scrape sid into auth.json when Chrome is logged in. The old
+	// "dashboard up → return" fast path skipped CDP sync, so recoverSession
+	// (wipe/reach) printed "Synced cookies" then immediately 401'd on CSRF.
+	looksIn := chromeLooksLoggedIn()
+	if looksIn {
 		fmt.Println("Chrome session ready — continuing.")
 		_ = os.Stdout.Sync()
+	}
+
+	// Unattended setup: Chrome dashboard is enough. Do not block on CDP cookie
+	// scrape / OneDrive auth.json / proxy CSRF — those hung the lane for minutes
+	// after "session ready" with no further log lines.
+	if skipSetupAgeKey && looksIn {
+		if name := strings.TrimSpace(auth.Blog); usableBlogName(name) {
+			fmt.Println("Active blog:", name, "(from saved auth — setup continues)")
+		} else {
+			fmt.Println("Chrome logged in — setup continues (skipping slow cookie/CSRF sync).")
+		}
+		_ = os.Stdout.Sync()
+		go func() {
+			cookies, err := cookiesFromDebugPortTimed(3 * time.Second)
+			if err != nil || cookieValue(cookies, "sid") == "" {
+				return
+			}
+			auth.Cookie = buildTumblrCookieHeader(cookies)
+			persistMaturePref(auth)
+			_ = saveAuth(*auth)
+		}()
+		loginOK = true
 		return cmd, nil
 	}
 
@@ -715,6 +803,10 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		if sid != "" {
 			auth.Cookie = buildTumblrCookieHeader(cookies)
 			persistMaturePref(auth)
+			clearNeedsInteractiveLogin(auth)
+			if liveChromeProxyID != "" {
+				auth.ProxyID = liveChromeProxyID
+			}
 			if err := saveAuth(*auth); err != nil {
 				stopChrome(cmd)
 				return nil, err
@@ -725,7 +817,7 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		_ = os.Stdout.Sync()
 	}
 	if sid == "" {
-		if !chromeLooksLoggedIn() {
+		if !looksIn && !chromeLooksLoggedIn() {
 			stopChrome(cmd)
 			if err != nil {
 				return nil, err
@@ -734,54 +826,62 @@ func startChromeLoggedInOpts(auth *Auth, forceForm, visible bool) (*exec.Cmd, er
 		}
 		fmt.Println("Could not read sid yet, but Chrome is logged in — continuing.")
 		_ = os.Stdout.Sync()
+		loginOK = true
 		return cmd, nil
 	}
 
-	if sid != "" {
-		client := newAuthClient(auth)
-		if client != nil && client.Timeout > 12*time.Second {
-			client.Timeout = 12 * time.Second
-		}
-		if err := refreshCSRF(client, auth); err != nil {
-			fmt.Println("CSRF refresh warning:", err)
-			if !forceForm && auto {
-				fmt.Println("Saved session is dead — logging out of Chrome and signing in again…")
-				if err := finishChromeLoginWait(cmd, reloginTumblrInChrome(creds)); err != nil {
-					stopChrome(cmd)
-					return nil, err
-				}
-				cookies, err = cookiesFromDebugPort()
-				if err != nil {
-					stopChrome(cmd)
-					return nil, err
-				}
-				if cookieValue(cookies, "sid") == "" {
-					stopChrome(cmd)
-					return nil, fmt.Errorf("still no sid cookie — login did not complete")
-				}
-				auth.Cookie = buildTumblrCookieHeader(cookies)
-				persistMaturePref(auth)
-				if err := saveAuth(*auth); err != nil {
-					stopChrome(cmd)
-					return nil, err
-				}
-			} else {
+	// Setup-only fast path: cookies are on disk; skip proxy CSRF/identity so
+	// profile setup is not blocked by API. recoverSession re-checks CSRF next.
+	if looksIn && forceForm == false && !auto {
+		loginOK = true
+		return cmd, nil
+	}
+
+	client := newAuthClient(auth)
+	if client != nil && client.Timeout > 8*time.Second {
+		client.Timeout = 8 * time.Second
+	}
+	if err := refreshCSRF(client, auth); err != nil {
+		fmt.Println("CSRF refresh warning:", err)
+		if !forceForm && auto {
+			fmt.Println("Saved session is dead — logging out of Chrome and signing in again…")
+			if err := finishChromeLoginWait(cmd, reloginTumblrInChrome(creds)); err != nil {
 				stopChrome(cmd)
-				return nil, fmt.Errorf("Tumblr still unauthorized after login: %w", err)
+				return nil, err
 			}
-		}
-		if name, err := syncAuthIdentity(client, auth); err != nil {
-			maybeFillBlog(client, auth)
-			fmt.Println("Could not detect blog identity yet:", err)
+			cookies, err = cookiesFromDebugPort()
+			if err != nil {
+				stopChrome(cmd)
+				return nil, err
+			}
+			if cookieValue(cookies, "sid") == "" {
+				stopChrome(cmd)
+				return nil, fmt.Errorf("still no sid cookie — login did not complete")
+			}
+			auth.Cookie = buildTumblrCookieHeader(cookies)
+			persistMaturePref(auth)
+			if err := saveAuth(*auth); err != nil {
+				stopChrome(cmd)
+				return nil, err
+			}
+		} else if forceForm {
+			// recoverSession / -login: cookies were just minted in Chrome; a
+			// transient 401 here must not discard them — caller retries CSRF.
+			fmt.Println("CSRF not ready yet — cookies saved; caller will retry.")
 		} else {
-			fmt.Println("Active blog:", name, "("+auth.Blog+")")
+			stopChrome(cmd)
+			return nil, fmt.Errorf("Tumblr still unauthorized after login: %w", err)
 		}
+	} else if name, err := syncAuthIdentity(client, auth); err != nil {
+		maybeFillBlog(client, auth)
+		fmt.Println("Could not detect blog identity yet:", err)
 	} else {
-		fmt.Println("Chrome is signed in — skipping API cookie sync until sid is readable.")
+		fmt.Println("Active blog:", name, "("+auth.Blog+")")
 	}
 	// Password/leak dismiss runs in ensurePasswordNagWatcher with a hard
 	// timeout. Doing it inline here used to freeze setup on the dashboard
 	// when UIA hung walking Chrome's tree.
+	loginOK = true
 	return cmd, nil
 }
 
@@ -791,6 +891,9 @@ func loginWaitBudget() time.Duration {
 	}
 	if quietChromeLogin {
 		return 90 * time.Second
+	}
+	if skipSetupAgeKey {
+		return 45 * time.Second // unattended: don't babysit captcha for minutes
 	}
 	return 8 * time.Minute
 }
@@ -816,24 +919,36 @@ func finishChromeLoginWait(cmd *exec.Cmd, fillErr error) error {
 		fmt.Println("Auto-login failed:", fillErr)
 		stopChrome(cmd)
 		time.Sleep(1 * time.Second)
+		// Setup lanes must not wipe credentials on a flaky "wrong password"
+		// flash (empty React fields / captcha). Keep the login for a retry.
+		if skipSetupAgeKey {
+			fmt.Println("Keeping credentials (setup mode) — not discarding.")
+			return fillErr
+		}
 		_ = discardDeadLogin(b.Email)
 		return fillErr
 	}
-	// Headless cannot clear captcha — close and let setup move to the next account.
-	if fillErr != nil && headlessChrome && strings.Contains(strings.ToLower(fillErr.Error()), "captcha") {
-		fmt.Println("Headless login blocked by captcha — closing Chrome, next account.")
-		stopChromeOpts(cmd, false)
-		return fillErr
+	// Headless / quiet / unattended setup cannot babysit captcha — close and move on.
+	if fillErr != nil && strings.Contains(strings.ToLower(fillErr.Error()), "captcha") {
+		if headlessChrome || quietChromeLogin || skipSetupAgeKey {
+			fmt.Println("Login blocked by captcha — closing Chrome, next account.")
+			stopChromeOpts(cmd, false)
+			return fillErr
+		}
 	}
 	if fillErr != nil {
 		fmt.Println("Login not finished yet:", fillErr)
-		if !quietChromeLogin && !headlessChrome {
+		if !quietChromeLogin && !headlessChrome && !skipSetupAgeKey {
 			fmt.Println("Chrome stays open. Finish captcha/2FA in the window if it appears — I will not close it early.")
 		}
 	} else {
 		fmt.Println("Login submitted — waiting for session…")
 	}
-	if err := waitForTumblrSession(loginWaitBudget()); err != nil {
+	waitBudget := loginWaitBudget()
+	if skipSetupAgeKey {
+		waitBudget = 45 * time.Second
+	}
+	if err := waitForTumblrSession(waitBudget); err != nil {
 		if isPasswordChangeRequired(err) {
 			var p passwordChangeRequiredError
 			_ = errors.As(err, &p)
@@ -854,13 +969,45 @@ func finishChromeLoginWait(cmd *exec.Cmd, fillErr error) error {
 			if acc, ok := currentAccount(); ok {
 				email = acc.Email
 			}
-			fmt.Println("Tumblr says this email/password is wrong.")
+			// After a missed/abandoned captcha Tumblr often flashes the same
+			// "incorrect email or password" banner — do NOT discard; retry fill.
+			if fillErr != nil && strings.Contains(strings.ToLower(fillErr.Error()), "captcha") {
+				fmt.Println("Login error banner after captcha — retrying fill (not discarding)…")
+				if retryErr := retryBadLoginFillInLiveChrome(); retryErr == nil {
+					if err := waitForTumblrSession(loginWaitBudget()); err == nil {
+						return nil
+					}
+				} else {
+					fmt.Println("Login retry after captcha:", retryErr)
+				}
+				stopChromeOpts(cmd, false)
+				return fmt.Errorf("captcha/login blocked — skipped")
+			}
+			fmt.Println("Tumblr says this email/password is wrong — retrying before discard…")
+			if retryErr := retryBadLoginFillInLiveChrome(); retryErr == nil {
+				if err := waitForTumblrSession(loginWaitBudget()); err == nil {
+					return nil
+				}
+			} else {
+				fmt.Println("Login retry:", retryErr)
+			}
+			if !pageShowsBadLogin() {
+				// Banner cleared / moved on — give session wait one more shot.
+				if err := waitForTumblrSession(loginWaitBudget()); err == nil {
+					return nil
+				}
+			}
+			fmt.Println("Tumblr still says this email/password is wrong.")
 			stopChrome(cmd)
 			time.Sleep(1 * time.Second)
+			if skipSetupAgeKey {
+				fmt.Println("Keeping credentials (setup mode) — not discarding.")
+				return badLoginError{Email: email, ID: accountSlug(email)}
+			}
 			_ = discardDeadLogin(email)
 			return badLoginError{Email: email, ID: accountSlug(email)}
 		}
-		if recoverLiveDebugPort() && !quietChromeLogin {
+		if recoverLiveDebugPort() && !quietChromeLogin && !skipSetupAgeKey {
 			fmt.Println("Still no sid — Chrome is open. Waiting longer for captcha/2FA…")
 			if err := waitForTumblrSession(loginWaitBudget()); err == nil {
 				return nil
@@ -872,6 +1019,28 @@ func finishChromeLoginWait(cmd *exec.Cmd, fillErr error) error {
 	return nil
 }
 
+// retryBadLoginFillInLiveChrome reloads /login and runs the filled-form retry
+// loop while Chrome is still open (finishChromeLoginWait path).
+func retryBadLoginFillInLiveChrome() error {
+	creds, err := loadCredentials()
+	if err != nil {
+		return err
+	}
+	ctx, cancel, err := withBotChrome(90 * time.Second)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return chromedp.Run(ctx,
+		chromedp.Navigate("https://www.tumblr.com/login"),
+		chromedp.WaitReady("body", chromedp.ByQuery),
+		chromedp.Sleep(1500*time.Millisecond),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return fillTumblrLoginFormJS(ctx, creds)
+		}),
+	)
+}
+
 func pageShowsBadLogin() bool {
 	ctx, cancel, err := withBotChrome(8 * time.Second)
 	if err != nil {
@@ -880,6 +1049,11 @@ func pageShowsBadLogin() bool {
 	defer cancel()
 	var bad bool
 	_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		// Captcha / verify UI can leave copy that looks like a login error.
+		if evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
+			bad = false
+			return nil
+		}
 		bad = evalBoolJS(ctx, tumblrLoginErrorJS)
 		return nil
 	}))
@@ -1049,6 +1223,13 @@ const tumblrLoginErrorJS = `(() => {
 	return /email or password (you entered )?(is|was|were) incorrect|incorrect email or password|that password is incorrect/.test(t);
 })()`
 
+// tumblrRecaptchaFailedJS is Google's "Verification failed / try again" after a bad click.
+const tumblrRecaptchaFailedJS = `(() => {
+	const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+	return /verification failed|could not verify|please try again|try again later/i.test(t) &&
+		/recaptcha|robot|captcha|check the box/i.test(t);
+})()`
+
 // Tumblr's red login banner when the account must reset before signing in.
 // Not Chrome's breach nag — that is dismissed separately and never blocks sid.
 const tumblrPasswordChangeRequiredJS = `(() => {
@@ -1114,22 +1295,68 @@ const tumblrCaptchaVisibleJS = `(() => {
 	return !!explicit;
 })()`
 
-// tumblrRecaptchaAnchorBoxJS returns {x,y,w,h} of the visible reCAPTCHA checkbox iframe, or null.
+// tumblrRecaptchaAnchorBoxJS returns hit points for the checkbox box and/or the
+// "I'm not a robot" / "I am not a robot" text. Either is a valid click target.
 const tumblrRecaptchaAnchorBoxJS = `(() => {
-	const vis = (el) => {
+	const vis = (el, minW, minH) => {
 		if (!el) return false;
 		const s = getComputedStyle(el);
 		if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
 		const r = el.getBoundingClientRect();
-		return r.width > 100 && r.height > 40;
+		return r.width >= minW && r.height >= minH;
 	};
-	const f = [...document.querySelectorAll('iframe')].find(el => {
-		const meta = ((el.src || '') + ' ' + (el.title || '')).toLowerCase();
-		return vis(el) && /recaptcha/i.test(meta) && (/anchor/i.test(meta) || /recaptcha/i.test(el.title || ''));
+	const hits = [];
+	const add = (cx, cy, kind) => {
+		if (!(cx > 0 && cy > 0)) return;
+		hits.push({ cx, cy, kind });
+	};
+	const robotRe = /i('|’| a)?m not a robot/i;
+	// Google anchor iframe: left strip = checkbox, right = robot text.
+	const frames = [...document.querySelectorAll('iframe')].filter(el => {
+		const meta = ((el.src || '') + ' ' + (el.title || '') + ' ' + (el.name || '') + ' ' + (el.id || '')).toLowerCase();
+		if (!/recaptcha|hcaptcha|anchor/.test(meta)) return false;
+		return vis(el, 40, 20);
 	});
-	if (!f) return null;
-	const r = f.getBoundingClientRect();
-	return { x: r.x, y: r.y, w: r.width, h: r.height };
+	let f = frames.find(el => /anchor/i.test((el.src || '') + (el.name || '') + (el.title || '')));
+	if (!f) f = frames.find(el => /recaptcha/i.test(el.title || ''));
+	if (!f) f = frames[0];
+	if (f) {
+		const r = f.getBoundingClientRect();
+		// Checkbox sits in the left square of the anchor (~28×28). Aim dead-center.
+		const box = Math.min(28, Math.max(18, r.height * 0.72));
+		add(r.x + box / 2, r.y + r.height / 2, 'box');
+		add(r.x + r.width * 0.42, r.y + r.height / 2, 'text');
+	}
+	// Page copy: "I am not a robot" / "I'm not a robot" (outside iframe).
+	for (const el of document.querySelectorAll('div,span,label,p,b,strong')) {
+		if (!vis(el, 20, 8)) continue;
+		const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+		if (!robotRe.test(t) || t.length > 48) continue;
+		const r = el.getBoundingClientRect();
+		add(r.x + r.width / 2, r.y + r.height / 2, 'label');
+		add(Math.max(8, r.x - 32), r.y + r.height / 2, 'box-near-label');
+		break;
+	}
+	// Tumblr prompt sits under the widget — click just above it for the box.
+	for (const el of document.querySelectorAll('div,span,label,p,b,strong')) {
+		if (!vis(el, 40, 8)) continue;
+		const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+		if (!/check the box above to continue/i.test(t) || t.length > 60) continue;
+		const r = el.getBoundingClientRect();
+		add(r.x + 24, r.y - 28, 'above-prompt-box');
+		add(r.x + 90, r.y - 28, 'above-prompt-text');
+		break;
+	}
+	if (!hits.length) return null;
+	const first = hits[0];
+	return {
+		x: first.cx, y: first.cy, w: 40, h: 40,
+		cx: first.cx, cy: first.cy,
+		vw: window.innerWidth || 0,
+		vh: window.innerHeight || 0,
+		dpr: window.devicePixelRatio || 1,
+		hits,
+	};
 })()`
 
 const tumblrLoginNeedsRefillJS = `(() => {
@@ -1178,6 +1405,44 @@ func waitJSTrue(ctx context.Context, timeout time.Duration, script string) error
 	return fmt.Errorf("timed out")
 }
 
+// clearTumblrLoginFieldsJS empties email+password so accidental keystrokes
+// (or a half-typed OS click) cannot ride along into the next submit.
+const clearTumblrLoginFieldsJS = `(() => {
+	const vis = (el) => {
+		if (!el) return false;
+		const s = getComputedStyle(el);
+		if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+		const r = el.getBoundingClientRect();
+		return r.width > 2 && r.height > 2;
+	};
+	const wipe = (el) => {
+		if (!el) return;
+		el.focus();
+		try { el.select(); } catch (e) {}
+		const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+		if (desc && desc.set) {
+			desc.set.call(el, '');
+		} else {
+			el.value = '';
+		}
+		try { el.setAttribute('value', ''); } catch (e) {}
+		el.dispatchEvent(new Event('input', { bubbles: true }));
+		try { el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null })); } catch (e) {}
+		el.dispatchEvent(new Event('change', { bubbles: true }));
+		el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Backspace' }));
+	};
+	const emailSel = 'input[name="email"], input[type="email"], input[placeholder="Email"], input[aria-label="email"], input[autocomplete="username"]';
+	const passSel = 'input[name="password"], input[type="password"], input[aria-label="password"], input[autocomplete="current-password"]';
+	[...document.querySelectorAll(emailSel)].filter(vis).forEach(wipe);
+	[...document.querySelectorAll(passSel)].filter(vis).forEach(wipe);
+	return true;
+})()`
+
+func clearTumblrLoginFields(ctx context.Context) {
+	var ok bool
+	_ = chromedp.Evaluate(clearTumblrLoginFieldsJS, &ok).Do(ctx)
+}
+
 func fillVisibleInputJS(kind, value string) string {
 	val, _ := json.Marshal(value)
 	sel := `input[name="email"], input[type="email"], input[placeholder="Email"], input[aria-label="email"], input[autocomplete="username"]`
@@ -1185,6 +1450,8 @@ func fillVisibleInputJS(kind, value string) string {
 		sel = `input[name="password"], input[type="password"], input[aria-label="password"], input[autocomplete="current-password"]`
 	}
 	selJSON, _ := json.Marshal(sel)
+	// Prefer document.execCommand('insertText') — Tumblr's React inputs often
+	// ignore native value setters, so the field looks empty even when we "filled".
 	return fmt.Sprintf(`(() => {
 		const vis = (el) => {
 			if (!el) return false;
@@ -1193,19 +1460,30 @@ func fillVisibleInputJS(kind, value string) string {
 			const r = el.getBoundingClientRect();
 			return r.width > 2 && r.height > 2;
 		};
+		const want = %s;
 		const nodes = [...document.querySelectorAll(%s)].filter(vis);
 		const el = nodes[0];
 		if (!el) return 'missing';
+		el.scrollIntoView({ block: 'center', inline: 'nearest' });
 		el.focus();
+		try { el.click(); } catch (e) {}
+		try { el.select(); } catch (e) {}
 		const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
 		desc.set.call(el, '');
+		try { el.setAttribute('value', ''); } catch (e) {}
 		el.dispatchEvent(new Event('input', { bubbles: true }));
-		desc.set.call(el, %s);
-		el.dispatchEvent(new Event('input', { bubbles: true }));
-		try { el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: %s })); } catch (e) {}
-		el.dispatchEvent(new Event('change', { bubbles: true }));
+		let inserted = false;
+		try { inserted = document.execCommand('insertText', false, want); } catch (e) { inserted = false; }
+		if (!inserted || el.value !== want) {
+			desc.set.call(el, want);
+			try { el.setAttribute('value', want); } catch (e) {}
+			el.dispatchEvent(new Event('input', { bubbles: true }));
+			try { el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: want })); } catch (e) {}
+			el.dispatchEvent(new Event('change', { bubbles: true }));
+		}
+		if (el.value !== want) return 'stuck:' + String(el.value || '').length + '/' + want.length;
 		return 'ok';
-	})()`, string(selJSON), string(val), string(val))
+	})()`, string(val), string(selJSON))
 }
 
 func clickTumblrLoginButton(ctx context.Context) error {
@@ -1238,8 +1516,40 @@ func clickTumblrLoginButton(ctx context.Context) error {
 	return nil
 }
 
+// badLoginFillRetries: Tumblr sometimes flashes "incorrect email or password"
+// after a flaky captcha / rate blip even when the password is right. Re-fill
+// and resubmit a few times before treating it as a real dead login.
+const badLoginFillRetries = 3
+
 func fillTumblrLoginFormJS(ctx context.Context, creds Credentials) error {
-	return fillTumblrLoginFormAttempt(ctx, creds, true)
+	var last error
+	for attempt := 1; attempt <= badLoginFillRetries; attempt++ {
+		err := fillTumblrLoginFormAttempt(ctx, creds, true)
+		if err == nil {
+			return nil
+		}
+		last = err
+		if !isBadLogin(err) {
+			return err
+		}
+		if attempt >= badLoginFillRetries {
+			break
+		}
+		fmt.Printf("Tumblr says email/password wrong — clearing fields and re-entering (%d/%d)…\n", attempt, badLoginFillRetries-1)
+		_ = os.Stdout.Sync()
+		clearTumblrLoginFields(ctx)
+		time.Sleep(400 * time.Millisecond)
+		// Stay on the form when possible; only reload if fields vanished.
+		if !evalBoolJS(ctx, tumblrVisibleEmailJS) {
+			if navErr := chromedp.Navigate("https://www.tumblr.com/login").Do(ctx); navErr != nil {
+				fmt.Println("login retry navigate:", navErr)
+			} else {
+				_ = chromedp.WaitReady("body", chromedp.ByQuery).Do(ctx)
+				time.Sleep(1500 * time.Millisecond)
+			}
+		}
+	}
+	return last
 }
 
 func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bool) error {
@@ -1260,13 +1570,19 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 		blockNativeTumblrLoginSubmit(ctx)
 	}
 
+	// Always wipe first — accidental keystrokes / leftover text must not stick.
+	clearTumblrLoginFields(ctx)
+	time.Sleep(200 * time.Millisecond)
+
 	var filled string
 	if err := chromedp.Evaluate(fillVisibleInputJS("email", email), &filled).Do(ctx); err != nil {
 		return err
 	}
 	if filled != "ok" {
-		return fmt.Errorf("login form: no visible email field")
+		return fmt.Errorf("login form: email fill failed (%s)", filled)
 	}
+	fmt.Printf("Email/username typed (%d chars)\n", len(email))
+	_ = os.Stdout.Sync()
 
 	if !evalBoolJS(ctx, tumblrVisiblePasswordJS) {
 		_ = clickTumblrLoginButton(ctx)
@@ -1285,8 +1601,10 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 		return err
 	}
 	if filled != "ok" {
-		return fmt.Errorf("login form: no visible password field")
+		return fmt.Errorf("login form: password fill failed (%s)", filled)
 	}
+	fmt.Printf("Password typed (%d chars)\n", len(pass))
+	_ = os.Stdout.Sync()
 	if evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
 		return waitOutLoginCaptcha(ctx, email)
 	}
@@ -1301,7 +1619,7 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 		if evalBoolJS(ctx, tumblrPasswordChangeRequiredJS) {
 			return passwordChangeRequiredError{Email: email, ID: accountSlug(email)}
 		}
-		if evalBoolJS(ctx, tumblrLoginErrorJS) {
+		if evalBoolJS(ctx, tumblrLoginErrorJS) && !evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
 			return badLoginError{Email: email, ID: accountSlug(email)}
 		}
 		if evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
@@ -1320,7 +1638,7 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 	if evalBoolJS(ctx, tumblrPasswordChangeRequiredJS) {
 		return passwordChangeRequiredError{Email: email, ID: accountSlug(email)}
 	}
-	if evalBoolJS(ctx, tumblrLoginErrorJS) {
+	if evalBoolJS(ctx, tumblrLoginErrorJS) && !evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
 		return badLoginError{Email: email, ID: accountSlug(email)}
 	}
 	if evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
@@ -1334,19 +1652,42 @@ func fillTumblrLoginFormAttempt(ctx context.Context, creds Credentials, retry bo
 	return fmt.Errorf("still on login page")
 }
 
-// waitOutLoginCaptcha tries the I'm-not-a-robot box once, then waits for Harrie
-// (or the challenge) so we don't spin-refill the form over the captcha.
+// waitOutLoginCaptcha clicks I'm-not-a-robot, waits for Google to verify, and
+// re-aims/retries if the box is still up (missed click, cursor moved, etc.).
+// Gaps stay long — spam re-clicks cause "Verification failed".
 func waitOutLoginCaptcha(ctx context.Context, email string) error {
-	fmt.Println("reCAPTCHA on the login form — click \"I'm not a robot\" in Chrome if it isn't already checked.")
+	fmt.Println("reCAPTCHA on the login form — OS click on I'm-not-a-robot (will re-aim if we miss)…")
 	_ = os.Stdout.Sync()
-	_ = clickRecaptchaCheckboxIfPresent(ctx)
-	waitFor := 3 * time.Minute
+	waitFor := 90 * time.Second
+	clickEvery := 8 * time.Second
+	maxClicks := 5
 	if headlessChrome {
-		// Headless cannot solve captchas — fail fast so parallel setup moves on.
-		waitFor = 12 * time.Second
+		waitFor = 10 * time.Second
+		maxClicks = 1
+	} else if quietChromeLogin {
+		waitFor = 40 * time.Second
+		maxClicks = 3
 	}
 	deadline := time.Now().Add(waitFor)
-	lastNudge := time.Time{}
+	lastClick := time.Time{}
+	clicks := 0
+	tryClick := func(n int, why string) {
+		raiseLiveChromeWindow(liveChromeAccount)
+		time.Sleep(350 * time.Millisecond) // let the window settle after raise / mouse jostle
+		lastRecaptchaOSClick = time.Time{}  // allow intentional re-aim after a miss
+		if err := clickRecaptchaCheckboxIfPresent(ctx); err != nil {
+			fmt.Printf("reCAPTCHA click #%d (%s): %v\n", n, why, err)
+		} else {
+			fmt.Printf("reCAPTCHA click #%d (%s) — waiting for Google…\n", n, why)
+		}
+		_ = os.Stdout.Sync()
+	}
+	// First click immediately.
+	if !headlessChrome {
+		clicks++
+		lastClick = time.Now()
+		tryClick(clicks, "first")
+	}
 	for time.Now().Before(deadline) {
 		var href string
 		_ = chromedp.Location(&href).Do(ctx)
@@ -1354,53 +1695,152 @@ func waitOutLoginCaptcha(ctx context.Context, email string) error {
 			fmt.Println("Captcha cleared — logged in.")
 			return nil
 		}
-		if evalBoolJS(ctx, tumblrLoginErrorJS) {
-			return badLoginError{Email: email, ID: accountSlug(email)}
+		// Tumblr often shows "incorrect email or password" after a failed /
+		// abandoned captcha. Bubble out so finishChromeLoginWait can retry fill
+		// (do not nest another captcha wait / discard here).
+		if evalBoolJS(ctx, tumblrLoginErrorJS) && !evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
+			fmt.Println("Login error banner after captcha — will retry fill (not discarding).")
+			_ = os.Stdout.Sync()
+			return fmt.Errorf("captcha/login blocked — skipped")
 		}
 		if evalBoolJS(ctx, tumblrPasswordChangeRequiredJS) {
 			return passwordChangeRequiredError{Email: email, ID: accountSlug(email)}
 		}
-		if !evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
-			// Checkbox done / challenge gone — try Log in.
+		failed := evalBoolJS(ctx, tumblrRecaptchaFailedJS)
+		stillUp := evalBoolJS(ctx, tumblrCaptchaVisibleJS)
+		if !stillUp {
+			// Checkbox accepted / challenge gone — try Log in once.
 			_ = clickTumblrLoginButton(ctx)
-			time.Sleep(1500 * time.Millisecond)
+			time.Sleep(900 * time.Millisecond)
 			_ = chromedp.Location(&href).Do(ctx)
 			if loginFillDone(href, cookieOK(ctx)) {
 				fmt.Println("Captcha cleared — logged in.")
 				return nil
 			}
-		} else if lastNudge.IsZero() || time.Since(lastNudge) > 45*time.Second {
-			lastNudge = time.Now()
-			if headlessChrome {
-				fmt.Println("Headless captcha — skipping this account (solve on the visible lane).")
+		} else if !headlessChrome && clicks < maxClicks && time.Since(lastClick) >= clickEvery {
+			why := "still up — re-aim"
+			if failed {
+				why = "verification failed — retry"
+				fmt.Println("reCAPTCHA said verification failed — slow re-aim…")
+				_ = os.Stdout.Sync()
 			} else {
-				fmt.Println("Still waiting on captcha in the Chrome window…")
-				raiseLiveChromeWindow(liveChromeAccount)
+				fmt.Println("reCAPTCHA still up (missed or cursor moved) — raising window and clicking again…")
+				_ = os.Stdout.Sync()
 			}
-			_ = os.Stdout.Sync()
+			clicks++
+			lastClick = time.Now()
+			tryClick(clicks, why)
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 	if headlessChrome {
 		return fmt.Errorf("headless captcha — skipped")
 	}
-	return fmt.Errorf("waiting for captcha")
+	fmt.Printf("Captcha still up after %d careful click(s) / %s — skipping this account.\n", clicks, waitFor)
+	_ = os.Stdout.Sync()
+	return fmt.Errorf("captcha not cleared — skipped")
 }
 
+var lastRecaptchaOSClick time.Time
+
 func clickRecaptchaCheckboxIfPresent(ctx context.Context) error {
-	var box map[string]float64
+	// Physical mouse is allowed ONLY while the I'm-not-a-robot UI is on screen.
+	if !evalBoolJS(ctx, tumblrCaptchaVisibleJS) {
+		return fmt.Errorf("no recaptcha on screen")
+	}
+	var box map[string]any
 	if err := chromedp.Evaluate(tumblrRecaptchaAnchorBoxJS, &box).Do(ctx); err != nil {
 		return err
 	}
-	if box == nil || box["w"] < 40 || box["h"] < 20 {
+	return clickRecaptchaBox(ctx, box)
+}
+
+// clickRecaptchaBox does ONE physical click on the checkbox only.
+// Clicking the text too / re-clicking while Google verifies → "Verification failed".
+func clickRecaptchaBox(ctx context.Context, box map[string]any) error {
+	// Global cool-down so session-wait nudge + login wait don't double-click.
+	// Intentional re-aims clear lastRecaptchaOSClick before calling us.
+	if !lastRecaptchaOSClick.IsZero() && time.Since(lastRecaptchaOSClick) < 7*time.Second {
+		return fmt.Errorf("reCAPTCHA cool-down (avoid verification failed)")
+	}
+	points := recaptchaHitPoints(box)
+	if len(points) == 0 {
 		return fmt.Errorf("no recaptcha checkbox")
 	}
-	// Click left side of the widget (the checkbox), not the center (logo).
-	x := box["x"] + 28
-	y := box["y"] + box["h"]/2
-	fmt.Println("Clicking reCAPTCHA checkbox…")
+	x, y := points[0][0], points[0][1]
+	vw, _ := box["vw"].(float64)
+	vh, _ := box["vh"].(float64)
+	fmt.Println("Clicking reCAPTCHA checkbox (single OS click)…")
 	_ = os.Stdout.Sync()
-	return chromedp.MouseClickXY(x, y).Do(ctx)
+	raiseLiveChromeWindow(liveChromeAccount)
+	time.Sleep(200 * time.Millisecond)
+	withOSRecaptchaClick(func() {
+		// Calibrate CSS→screen via render-widget client size vs page viewport.
+		clickChromePageCSSForcedScaled(x, y, vw, vh)
+	})
+	lastRecaptchaOSClick = time.Now()
+	return nil
+}
+
+func recaptchaHitPoints(box map[string]any) [][2]float64 {
+	if box == nil {
+		return nil
+	}
+	var boxHits, other [][2]float64
+	if raw, ok := box["hits"].([]any); ok {
+		for _, item := range raw {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			x, _ := m["cx"].(float64)
+			y, _ := m["cy"].(float64)
+			if x <= 1 || y <= 1 {
+				continue
+			}
+			kind, _ := m["kind"].(string)
+			pt := [2]float64{x, y}
+			// Prefer the actual checkbox, never spray text/label hits.
+			if kind == "box" || kind == "box-near-label" || kind == "above-prompt-box" {
+				boxHits = append(boxHits, pt)
+			} else {
+				other = append(other, pt)
+			}
+		}
+	}
+	if len(boxHits) > 0 {
+		return boxHits[:1]
+	}
+	if len(other) > 0 {
+		return other[:1]
+	}
+	x, _ := box["cx"].(float64)
+	y, _ := box["cy"].(float64)
+	if x < 1 {
+		x, _ = box["x"].(float64)
+	}
+	if y < 1 {
+		y, _ = box["y"].(float64)
+	}
+	if x > 1 && y > 1 {
+		return [][2]float64{{x, y}}
+	}
+	return nil
+}
+
+// clickRecaptchaOnTarget clicks the checkbox via a page target (session wait path).
+// Does NOT click Log in here — wait for Google to verify first (see waitOutLoginCaptcha).
+func clickRecaptchaOnTarget(t chromeJSONTarget) error {
+	var captcha bool
+	_ = evalJSONOnChromeTarget(t, tumblrCaptchaVisibleJS, &captcha)
+	if !captcha {
+		return fmt.Errorf("no recaptcha on screen")
+	}
+	var box map[string]any
+	if err := evalJSONOnChromeTarget(t, tumblrRecaptchaAnchorBoxJS, &box); err != nil {
+		return err
+	}
+	return clickRecaptchaBox(nil, box)
 }
 
 func recoverCannotPostLogin(ctx context.Context, creds Credentials, retry bool) error {
@@ -1477,7 +1917,12 @@ func waitForTumblrSession(timeout time.Duration) error {
 		if hit := clickPrivacyConsentAgree(); hit != "" {
 			fmt.Println("Dismissed cookies:", hit)
 		}
-		if lastFillNudge.IsZero() || time.Since(lastFillNudge) > 25*time.Second {
+		nudgeEvery := 25 * time.Second
+		if skipSetupAgeKey {
+			// Setup: nudge often for empty forms, but captcha path self-throttles clicks.
+			nudgeEvery = 8 * time.Second
+		}
+		if lastFillNudge.IsZero() || time.Since(lastFillNudge) > nudgeEvery {
 			lastFillNudge = time.Now()
 			nudgeTumblrLoginIfStuck()
 		}
@@ -1530,8 +1975,9 @@ func nudgeTumblrLoginIfStuck() {
 	if captcha {
 		if !notedLoginCaptcha {
 			notedLoginCaptcha = true
-			fmt.Println("Captcha is showing in Chrome — finish it there. I will not refill the form.")
+			fmt.Println("Captcha is showing — auto-clicking I'm-not-a-robot (OS mouse)…")
 		}
+		_ = clickRecaptchaOnTarget(t)
 		return
 	}
 	_ = evalJSONOnChromeTarget(t, tumblrLoginNeedsRefillJS, &needFill)
@@ -3092,6 +3538,7 @@ func chromeDirForAccount(id string) (string, error) {
 }
 
 func detachLiveChrome() {
+	stopLiveChromeProxy()
 	holdLiveChromeContext(liveChromeCtx)
 	liveChromeCtx = nil
 	liveChromeCancel = nil

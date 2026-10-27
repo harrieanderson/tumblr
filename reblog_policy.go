@@ -24,10 +24,13 @@ type trailReblogConfig struct {
 }
 
 type nsfwReblogConfig struct {
-	// MaxCount NSFW engager-reblogs allowed inside WindowHours (per account).
+	// MaxCount NSFW reblogs allowed inside WindowHours (per account).
+	// Default: 1 per week (168h), chance-gated ("maybe").
 	MaxCount    int     `json:"maxCount"`
 	WindowHours int     `json:"windowHours"`
 	Chance      float64 `json:"chance"`
+	// SearchQueries used by the weekly session reblog (not engager posts).
+	SearchQueries []string `json:"searchQueries,omitempty"`
 }
 
 type reblogLedgerEntry struct {
@@ -62,10 +65,15 @@ func defaultTrailReblogConfig() trailReblogConfig {
 func defaultNSFWReblogConfig() nsfwReblogConfig {
 	return nsfwReblogConfig{
 		MaxCount:    1,
-		WindowHours: 72,
-		Chance:      0.08,
+		WindowHours: 168, // once a week
+		Chance:      0.15, // maybe — rolled per reach session / engager attempt
+		SearchQueries: []string{
+			"nsfw", "lewd", "thirst", "smut", "gay nsfw",
+		},
 	}
 }
+
+const nsfwReblogWindowDefaultHours = 168
 
 func reblogLedgerPath(accountID string) string {
 	accountID = accountSlug(accountID)
@@ -135,9 +143,25 @@ func canNSFWReblog(accountID string, cfg nsfwReblogConfig) bool {
 	}
 	hours := cfg.WindowHours
 	if hours <= 0 {
-		hours = 72
+		hours = nsfwReblogWindowDefaultHours
 	}
 	return nsfwReblogsInWindow(accountID, time.Duration(hours)*time.Hour) < cfg.MaxCount
+}
+
+func nsfwReblogCfgOrDefault(cfg nsfwReblogConfig) nsfwReblogConfig {
+	if cfg.MaxCount == 0 && cfg.WindowHours == 0 && cfg.Chance == 0 && len(cfg.SearchQueries) == 0 {
+		return defaultNSFWReblogConfig()
+	}
+	if cfg.WindowHours <= 0 {
+		cfg.WindowHours = nsfwReblogWindowDefaultHours
+	}
+	if cfg.Chance < 0 {
+		cfg.Chance = 0
+	}
+	if len(cfg.SearchQueries) == 0 {
+		cfg.SearchQueries = defaultNSFWReblogConfig().SearchQueries
+	}
+	return cfg
 }
 
 func trailReblogCountSince(accountID string, since time.Time) int {
@@ -156,19 +180,16 @@ func trailReblogCountSince(accountID string, since time.Time) int {
 }
 
 // maybeReblogEngagerPost: rare NSFW trail item from someone we engaged.
-// Returns whether a reblog happened.
+// Shares the weekly NSFW quota with maybeWeeklyNSFWReblog.
 func maybeReblogEngagerPost(client *http.Client, auth *Auth, cfg FollowConfig, blog string, reblogged map[string]bool, id string, logFn func(string)) bool {
-	nsfw := cfg.NSFWReblog
-	if nsfw.MaxCount == 0 && nsfw.WindowHours == 0 && nsfw.Chance == 0 {
-		nsfw = defaultNSFWReblogConfig()
-	}
+	nsfw := nsfwReblogCfgOrDefault(cfg.NSFWReblog)
 	if !canNSFWReblog(id, nsfw) {
-		accLog(id, logFn, "   skip NSFW reblog — quota used in last %dh", nsfw.WindowHours)
+		accLog(id, logFn, "   skip NSFW reblog — weekly quota used (1/%dh)", nsfw.WindowHours)
 		return false
 	}
 	chance := nsfw.Chance
 	if chance <= 0 {
-		chance = 0.08
+		chance = 0.15
 	}
 	if rand.Float64() >= chance {
 		return false
@@ -177,18 +198,94 @@ func maybeReblogEngagerPost(client *http.Client, auth *Auth, cfg FollowConfig, b
 	if err != nil || n <= 0 {
 		return false
 	}
-	// reblogFromBlog already marked reblogged[id]; find last id is awkward —
-	// record a ledger row with blog only if we don't know post id.
 	appendReblogLedger(id, reblogLedgerEntry{
 		Blog:     normalizeBlogName(blog),
 		PostID:   "engager:" + normalizeBlogName(blog) + ":" + time.Now().Format("20060102"),
 		Category: "nsfw_rare",
 		Source:   "engager:" + normalizeBlogName(blog),
-		Summary:  "rare NSFW reblog from engager",
+		Summary:  "weekly NSFW reblog from engager",
 		RunID:    reachRunID(id),
 	})
-	accLog(id, logFn, "   rare NSFW reblog from %s (quota %d/%dh)", blog, nsfwReblogsInWindow(id, time.Duration(nsfw.WindowHours)*time.Hour), nsfw.WindowHours)
+	accLog(id, logFn, "   weekly NSFW reblog from %s (quota %d/%dh)", blog, nsfwReblogsInWindow(id, time.Duration(nsfw.WindowHours)*time.Hour), nsfw.WindowHours)
 	return true
+}
+
+// maybeWeeklyNSFWReblog: once per week (tracked), maybe reblog one NSFW search post.
+// Called once per reach session so the public trail occasionally looks thirsty.
+func maybeWeeklyNSFWReblog(client *http.Client, auth *Auth, cfg FollowConfig, reblogged map[string]bool, id string, logFn func(string)) bool {
+	nsfw := nsfwReblogCfgOrDefault(cfg.NSFWReblog)
+	if nsfw.MaxCount <= 0 {
+		return false
+	}
+	if !canNSFWReblog(id, nsfw) {
+		accLog(id, logFn, "weekly NSFW reblog: skip — already used this week (%dh window)", nsfw.WindowHours)
+		return false
+	}
+	chance := nsfw.Chance
+	if chance <= 0 {
+		chance = 0.15
+	}
+	if rand.Float64() >= chance {
+		accLog(id, logFn, "weekly NSFW reblog: skipped this session (chance %.0f%%)", chance*100)
+		return false
+	}
+
+	queries := append([]string{}, nsfw.SearchQueries...)
+	if len(queries) == 0 {
+		queries = defaultNSFWReblogConfig().SearchQueries
+	}
+	rand.Shuffle(len(queries), func(i, j int) { queries[i], queries[j] = queries[j], queries[i] })
+
+	var posts []ScrapedPost
+	for _, q := range queries {
+		found, err := scrapeRecentPosts(client, *auth, q, 12)
+		if err != nil || len(found) == 0 {
+			found, err = scrapeTopPosts(client, *auth, q, 12)
+		}
+		if err != nil || len(found) == 0 {
+			continue
+		}
+		posts = found
+		accLog(id, logFn, "weekly NSFW reblog: search %q (%d posts)", q, len(found))
+		break
+	}
+	if len(posts) == 0 {
+		accLog(id, logFn, "weekly NSFW reblog: no posts found")
+		return false
+	}
+	rand.Shuffle(len(posts), func(i, j int) { posts[i], posts[j] = posts[j], posts[i] })
+
+	for _, p := range posts {
+		if p.ID == "" || reblogged[p.ID] {
+			continue
+		}
+		if p.ReblogKey == "" {
+			if enriched, err := fetchSinglePost(client, *auth, p); err == nil {
+				p = enriched
+			}
+		}
+		if p.ReblogKey == "" {
+			continue
+		}
+		accLog(id, logFn, "weekly NSFW reblog @%s — %s", p.Blog, truncate(p.Summary, 48))
+		if err := reblogPost(client, *auth, p); err != nil {
+			accLog(id, logFn, "  weekly NSFW reblog fail: %v", err)
+			continue
+		}
+		reblogged[p.ID] = true
+		appendReblogLedger(id, reblogLedgerEntry{
+			Blog:     normalizeBlogName(p.Blog),
+			PostID:   p.ID,
+			Category: "nsfw_rare",
+			Source:   "weekly_search",
+			Summary:  truncate(p.Summary, 80),
+			RunID:    reachRunID(id),
+		})
+		accLog(id, logFn, "weekly NSFW reblog OK — next eligible in ~%dh (ledger)", nsfw.WindowHours)
+		return true
+	}
+	accLog(id, logFn, "weekly NSFW reblog: no usable post")
+	return false
 }
 
 func reachRunID(accountID string) string {
@@ -331,5 +428,5 @@ func reblogPolicySummary(accountID string) string {
 	nsfw := defaultNSFWReblogConfig()
 	inWin := nsfwReblogsInWindow(accountID, time.Duration(nsfw.WindowHours)*time.Hour)
 	trail24 := trailReblogCountSince(accountID, time.Now().Add(-24*time.Hour))
-	return fmt.Sprintf("reblog ledger: NSFW %d/%d in %dh, SFW trail %d in 24h", inWin, nsfw.MaxCount, nsfw.WindowHours, trail24)
+	return fmt.Sprintf("reblog ledger: NSFW %d/%d per week (%dh), SFW trail %d in 24h", inWin, nsfw.MaxCount, nsfw.WindowHours, trail24)
 }

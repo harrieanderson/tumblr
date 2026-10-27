@@ -160,10 +160,12 @@ func (c setupLookCheck) essentialDone() bool {
 }
 
 // batchReady is the ship-it bar for -skip-agekey runs: Zoey title + username,
-// plus at least one of avatar/banner. Don't burn minutes on bio/colour HTTP verify.
+// colours (accent + background), plus at least one of avatar/banner.
+// Bio can still be best-effort; colours must not be skipped.
 func (c setupLookCheck) batchReady() bool {
 	if skipSetupAgeKey {
-		return c.TitleOK && c.UsernameOK && (c.AvatarOK || c.BannerOK)
+		return c.TitleOK && c.UsernameOK && (c.AvatarOK || c.BannerOK) &&
+			c.AccentOK && c.BackgroundOK
 	}
 	return c.essentialDone()
 }
@@ -250,6 +252,12 @@ func runCheckZoeySetup() error {
 	if len(accs) == 0 {
 		return fmt.Errorf("no enabled accounts")
 	}
+	viewer, viewerID, err := pickViewerAuth()
+	if err != nil {
+		fmt.Println("No shared viewer cookie — falling back to per-account sessions:", err)
+	} else {
+		fmt.Printf("Using shared viewer cookie from %s (no per-account login)\n", viewerID)
+	}
 	fmt.Printf("Checking Zoey look (username/title/bio/pic/banner/purple) on %d account(s)…\n", len(accs))
 
 	var rows []zoeyLookRow
@@ -257,7 +265,7 @@ func runCheckZoeySetup() error {
 	var needIDs []string
 
 	for i, a := range accs {
-		r := checkAccountZoeyLook(a, cfg)
+		r := checkAccountZoeyLook(a, cfg, viewer)
 		rows = append(rows, r)
 		counts[r.Status]++
 		if r.Status == "need" || r.Status == "partial" || r.Status == "essential" {
@@ -310,17 +318,37 @@ func runCheckZoeySetup() error {
 	return nil
 }
 
-func checkAccountZoeyLook(a Account, cfg profileSetupConfig) zoeyLookRow {
+// pickViewerAuth returns any enabled account with a live sid+CSRF so we can
+// fetch other blogs' public profiles without logging into each one.
+func pickViewerAuth() (Auth, string, error) {
+	for _, a := range enabledAccounts() {
+		auth, err := loadAuthFrom(accountAuthPath(a.ID))
+		if err != nil || !authHasSID(auth) {
+			continue
+		}
+		client := newHumanClient()
+		if err := refreshCSRF(client, &auth); err != nil {
+			continue
+		}
+		return auth, a.ID, nil
+	}
+	return Auth{}, "", fmt.Errorf("no logged-in account with a working session")
+}
+
+func checkAccountZoeyLook(a Account, cfg profileSetupConfig, viewer ...Auth) zoeyLookRow {
 	out := zoeyLookRow{ID: a.ID, Status: "skip"}
 	path := filepath.Join(profilesAuthDir, a.ID, "auth.json")
 	auth, err := loadAuthFrom(path)
 	if err != nil {
-		out.Detail = "no auth file"
-		return out
+		auth = Auth{}
 	}
 	client := newHumanClient()
 	var name string
-	if authHasSID(auth) {
+	// Prefer the assigned Zoey username — works even with no per-account cookie.
+	if n := assignedBlogName(a.ID); usableBlogName(n) {
+		name = n
+	}
+	if name == "" && authHasSID(auth) {
 		if err := refreshCSRF(client, &auth); err != nil {
 			_ = err
 		} else if blogs, err := listAccountBlogsDetailed(client, auth); err == nil {
@@ -361,11 +389,20 @@ func checkAccountZoeyLook(a Account, cfg profileSetupConfig) zoeyLookRow {
 		return out
 	}
 	out.Blog = name
-	p, err := fetchBlogProfile(client, auth, name)
+	// Shared viewer cookie fetches public blog info — no login into each profile.
+	fetchAuth := auth
+	if len(viewer) > 0 && authHasSID(viewer[0]) {
+		fetchAuth = viewer[0]
+	} else if !authHasSID(fetchAuth) {
+		if v, _, err := pickViewerAuth(); err == nil {
+			fetchAuth = v
+		}
+	}
+	p, err := fetchBlogProfile(client, fetchAuth, name)
 	if err != nil && strings.HasPrefix(name, "t:") && blogConfigured(auth.Blog) {
 		name = auth.Blog
 		out.Blog = name
-		p, err = fetchBlogProfile(client, auth, name)
+		p, err = fetchBlogProfile(client, fetchAuth, name)
 	}
 	if err != nil {
 		out.Detail = "@" + name + " fetch-failed"
@@ -409,8 +446,32 @@ func checkAccountZoeyLook(a Account, cfg profileSetupConfig) zoeyLookRow {
 
 func accountHasZoeyLook(a Account) (bool, string) {
 	r := checkAccountZoeyLook(a, loadProfileSetupConfig())
-	ok := r.Status == "full" || r.Status == "essential"
+	c := setupLookCheck{
+		TitleOK: r.TitleOK, BioOK: r.BioOK, AvatarOK: r.AvatarOK,
+		BannerOK: r.BannerOK, UsernameOK: r.UsernameOK,
+		AccentOK: r.AccentOK, BackgroundOK: r.BackgroundOK,
+	}
+	ok := c.Done() || c.batchReady() || r.Status == "full" || r.Status == "essential"
 	return ok, r.Detail
+}
+
+// accountNeedsZoeySetup is true when the blog is not yet Zoey-ready (or has no
+// usable session to judge). Used to build setup lanes that skip finished looks.
+func accountNeedsZoeySetup(a Account) (need bool, detail string) {
+	r := checkAccountZoeyLook(a, loadProfileSetupConfig())
+	if r.Status == "skip" {
+		// No cookies / dead session — still need setup (login + look).
+		return true, r.Detail
+	}
+	c := setupLookCheck{
+		TitleOK: r.TitleOK, BioOK: r.BioOK, AvatarOK: r.AvatarOK,
+		BannerOK: r.BannerOK, UsernameOK: r.UsernameOK,
+		AccentOK: r.AccentOK, BackgroundOK: r.BackgroundOK,
+	}
+	if c.Done() || c.batchReady() {
+		return false, r.Detail
+	}
+	return true, r.Detail
 }
 
 func lookStatusFromAPI(blog string) setupLookStatus {
@@ -481,6 +542,16 @@ func sessionBirthdayOK(st setupPageStatus) bool {
 
 func sessionAgeOK(st setupPageStatus) bool {
 	return st.Verified || setupAgeVerified
+}
+
+// matureSettingsOK is Show mature content ON and Blur mature content OFF.
+// Blur must be visible and explicitly off — missing/disabled blur does not count
+// (that was shipping accounts that still blur sensitive images).
+func matureSettingsOK(mt matureToggleStatus) bool {
+	if mt.State != "ready" || !mt.On {
+		return false
+	}
+	return mt.BlurState == "ready" && !mt.BlurOn
 }
 
 func setupFlag(ok bool) string {
@@ -668,17 +739,39 @@ func applySetupLook(cfg profileSetupConfig) {
 		return
 	}
 	setupBlogName = name
+	// Open Edit appearance once before checking — closed settings read banner/colours
+	// as missing and we used to re-upload the header on every pass.
+	if t, err := openBlogSettingsTab(setupBlogName); err == nil {
+		_ = withChromeTargetCDPFor(t, 20*time.Second, func(call cdpCall) error {
+			return cdpEnsureEditAppearance(call)
+		})
+		time.Sleep(400 * time.Millisecond)
+	}
 	check = refreshSetupLookCheck(setupBlogName, cfg)
-	if check.Done() {
+	// Only trust avatar/banner "already set" when WE uploaded them this campaign.
+	// Pre-existing custom pics / blob previews used to skip Zoey media entirely.
+	avatarTrusted := check.AvatarOK && lookAvatarAppliedByUs()
+	bannerTrusted := check.BannerOK && lookBannerAppliedByUs()
+	trustedDone := check.TitleOK && check.BioOK && check.UsernameOK &&
+		check.AccentOK && check.BackgroundOK && avatarTrusted && bannerTrusted
+	trustedBatch := skipSetupAgeKey && check.TitleOK && check.UsernameOK &&
+		check.AccentOK && check.BackgroundOK && (avatarTrusted || bannerTrusted)
+	if trustedDone || trustedBatch {
 		setupSay("Look already set (%s) — skipping appearance edits.", check.report())
 		return
 	}
-	// Already Zoey-named with title+avatar: still push banner once if missing.
-	needAvatar := !check.TitleOK || !check.BioOK || !check.AvatarOK
-	needTheme := !check.BannerOK || !check.AccentOK || !check.BackgroundOK
+	if (check.Done() || check.batchReady()) && (!avatarTrusted || !bannerTrusted) {
+		setupSay("Look looks set on page (%s) but Zoey media not recorded — uploading pic/banner.", check.report())
+	}
+	needTitleBio := !check.TitleOK || !check.BioOK
+	needAvatar := !avatarTrusted
+	needBanner := !bannerTrusted
+	needColors := !check.AccentOK || !check.BackgroundOK
+	needTheme := needBanner || needColors
 	needUser := !check.UsernameOK
-	setupSay("Look needs work: %s", check.report())
-	if needAvatar {
+	setupSay("Look needs work: %s (avatarTrusted=%s bannerTrusted=%s)",
+		check.report(), setupFlag(avatarTrusted), setupFlag(bannerTrusted))
+	if needTitleBio || needAvatar {
 		setupSay("Opening profile appearance for @%s", setupBlogName)
 		if err := applyBlogLookInChrome(pic, setupBlogName, cfg.Title, cfg.Description); err != nil {
 			setupSay("Avatar/title/bio: %s", err)
@@ -686,6 +779,8 @@ func applySetupLook(cfg profileSetupConfig) {
 				setupSay("Avatar fallback: %s", err2)
 			}
 		}
+	} else {
+		setupSay("Title/bio/avatar already set by us — not re-uploading them.")
 	}
 	if needTheme || needUser {
 		if err := applyBlogLookParts(setupBlogName, cfg, needTheme); err != nil {
@@ -698,6 +793,16 @@ func applySetupLook(cfg profileSetupConfig) {
 	time.Sleep(400 * time.Millisecond)
 	check = refreshSetupLookCheck(setupBlogName, cfg)
 	setupSay("Look check: %s", check.report())
+	// Colours only — applyBlogLookParts must not re-upload a banner that already stuck.
+	if !check.AccentOK || !check.BackgroundOK {
+		setupSay("Colours still missing (%s) — retrying accent/background only…", check.report())
+		if err := applyBlogLookParts(setupBlogName, cfg, true); err != nil {
+			setupSay("Colour retry: %s", err)
+		}
+		time.Sleep(400 * time.Millisecond)
+		check = refreshSetupLookCheck(setupBlogName, cfg)
+		setupSay("Look check after colours: %s", check.report())
+	}
 	if check.Done() {
 		setupSay("Look confirmed: profile pic, banner, title, bio, and username are set.")
 		return
@@ -706,8 +811,12 @@ func applySetupLook(cfg profileSetupConfig) {
 		setupSay("Look good enough for batch (%s) — next account.", check.report())
 		return
 	}
+	if check.TitleOK && check.UsernameOK && check.AccentOK && check.BackgroundOK {
+		setupSay("Core look + colours set; banner still incomplete (%s) — moving on.", check.report())
+		return
+	}
 	if check.TitleOK && check.UsernameOK {
-		setupSay("Core look set; banner/colours still incomplete (%s) — moving on.", check.report())
+		setupSay("Core look set but colours incomplete (%s) — moving on.", check.report())
 		return
 	}
 	setupSay("Look still incomplete (%s) — moving on.", check.report())
@@ -856,20 +965,36 @@ func readSetupLookCheck(blog string, cfg profileSetupConfig) setupLookCheck {
 			t, ok = page, true
 		}
 	}
+	pageHadSwatches := false
 	if ok {
 		st := readBlogLookStatus(t, cfg, "")
 		c.BannerOK = st.BannerOK
 		c.AccentOK = st.AccentOK
 		c.BackgroundOK = st.BackgroundOK
+		pageHadSwatches = st.Accent != "" || st.Background != "" || st.SwatchAccent != ""
 		if st.UserOK {
 			c.UsernameOK = true
 		}
 	}
-	if !skipSetupAgeKey {
-		if auth, err := loadAuth(); err == nil {
-			if p, err := fetchBlogProfile(newHumanClient(), auth, blog); err == nil {
-				st := savedThemeStatus(p, cfg)
-				c.AccentOK, c.BackgroundOK, c.BannerOK = st.AccentOK, st.BackgroundOK, st.BannerOK
+	// Always merge API theme when page couldn't see swatches/header (appearance
+	// closed). Skipping API under -skip-agekey was why we re-set banner forever.
+	if auth, err := loadAuth(); err == nil {
+		client := newHumanClient()
+		if client != nil && client.Timeout > 4*time.Second {
+			client.Timeout = 4 * time.Second
+		}
+		if p, err := fetchBlogProfile(client, auth, blog); err == nil {
+			st := savedThemeStatus(p, cfg)
+			if !c.BannerOK {
+				c.BannerOK = st.BannerOK
+			}
+			if !pageHadSwatches {
+				if !c.AccentOK {
+					c.AccentOK = st.AccentOK
+				}
+				if !c.BackgroundOK {
+					c.BackgroundOK = st.BackgroundOK
+				}
 			}
 		}
 	}
@@ -974,6 +1099,13 @@ func runSetupProfile() error {
 	setupBirthdayApplied = false
 	setupAgeVerified = false
 	setupSay("Using %s — if this line is missing, the GUI you clicked is an old process. Ctrl+C and run: go run . -gui", setupCodeStamp)
+	// Skip finished Zoey looks before opening Chrome — don't re-run near-done accounts.
+	if acc, ok := currentAccount(); ok {
+		if ready, detail := accountHasZoeyLook(acc); ready {
+			setupSay("Already Zoey-ready (%s) — skipping to the next unfinished account.", detail)
+			return nil
+		}
+	}
 	setupSay("Logging in, then account settings first (English, birthday, AgeKey), then appearance.")
 	// visible only when headless is off — Harrie can game while setup runs.
 	cmd, err := startChromeLoggedInOpts(&auth, false, !headlessChrome)
@@ -1049,15 +1181,14 @@ func runSetupProfile() error {
 	mt0 := readMatureToggleStatus()
 	bdayOK := sessionBirthdayOK(st0)
 	ageOK := sessionAgeOK(st0)
-	matureOK := mt0.On
-	if en0 && bdayOK && (skipSetupAgeKey || (ageOK && matureOK)) {
-		if skipSetupAgeKey {
-			setupSay("Account settings already Zoey-ready (English + birthday) — skipping straight to appearance.")
-		} else {
-			setupSay("Account settings already Zoey-ready (English + birthday + AgeKey/mature) — skipping straight to appearance.")
-		}
+	matureOK := matureSettingsOK(mt0)
+	// Settings are only done when English + birthday + Show mature ON / Blur OFF
+	// are confirmed. AgeKey can be skipped, but mature toggles are still required
+	// before appearance/personalisation — never skip straight there on English+birthday alone.
+	if en0 && bdayOK && matureOK && (skipSetupAgeKey || ageOK) {
+		setupSay("Account settings already Zoey-ready (English + birthday + Show mature on / Blur off) — skipping straight to appearance.")
 		setupBirthdayApplied = true
-		if ageOK {
+		if ageOK || matureOK {
 			setupAgeVerified = true
 		}
 	} else {
@@ -1073,10 +1204,15 @@ func runSetupProfile() error {
 			setupSay("Birthday already set — skipping.")
 			setupBirthdayApplied = true
 		} else {
+			maxBday := 3
+			if skipSetupAgeKey {
+				// Unattended lane: one try then move on — 3 retries burn minutes.
+				maxBday = 1
+			}
 			var berr error
-			for attempt := 1; attempt <= 3; attempt++ {
+			for attempt := 1; attempt <= maxBday; attempt++ {
 				if attempt > 1 {
-					setupSay("Birthday retry %d/3 — reopening account settings.", attempt)
+					setupSay("Birthday retry %d/%d — reopening account settings.", attempt, maxBday)
 					_, _ = waitForAccountSettingsPage()
 				}
 				berr = applyBirthdayOnSettings()
@@ -1085,12 +1221,14 @@ func runSetupProfile() error {
 					break
 				}
 				setupSay("Birthday: %s", berr)
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(250 * time.Millisecond)
 			}
 			if !setupBirthdayApplied {
 				if st := readSetupPageStatus(); sessionBirthdayOK(st) {
 					setupSay("Birthday shows set/locked on page — continuing.")
 					setupBirthdayApplied = true
+				} else if skipSetupAgeKey {
+					setupSay("Birthday not saved — continuing settings (AgeKey/birthday left for later).")
 				} else {
 					setupSay("Birthday still not saved after retries — staying on settings before appearance.")
 					setupSay("In Chrome, open Settings → set birthday 29 Dec 2000 if the fields are visible.")
@@ -1123,14 +1261,42 @@ func runSetupProfile() error {
 			}
 		}
 
-		if skipSetupAgeKey {
-			setupSay("4/5 Mature content skipped (needs AgeKey) — appearance next.")
+		// Always check/apply Show mature + Blur before personalisation.
+		setupSay("4/5 Show mature content, do not blur mature content")
+		mt0 = readMatureToggleStatus()
+		matureOK = matureSettingsOK(mt0)
+		setupSay("Mature check: show=%s on=%s blur=%s blurOn=%s",
+			mt0.State, setupFlag(mt0.On), mt0.BlurState, setupFlag(mt0.BlurOn))
+		if matureOK {
+			setupSay("Mature content already set (show on, blur off) — skipping.")
 		} else {
-			setupSay("4/5 Show mature content, do not blur mature content")
-			if matureOK {
-				setupSay("Mature content already on — skipping.")
-			} else if err := applyMatureContentInChrome(); err != nil {
+			if mt0.State == "missing" || mt0.State == "disabled" {
+				if !skipSetupAgeKey {
+					setupSay("Mature toggles still locked — waiting for unlock…")
+					if err := waitForMatureContentReady(); err != nil {
+						setupSay("Mature unlock wait: %s", err)
+					}
+				} else {
+					setupSay("Mature toggles locked (AgeKey not done) — trying once anyway.")
+				}
+			}
+			if err := applyMatureContentInChrome(); err != nil {
 				setupSay("Mature content: %s", err)
+			}
+			mt0 = readMatureToggleStatus()
+			matureOK = matureSettingsOK(mt0)
+			setupSay("Mature check after apply: show=%s on=%s blur=%s blurOn=%s",
+				mt0.State, setupFlag(mt0.On), mt0.BlurState, setupFlag(mt0.BlurOn))
+			if matureOK {
+				setupSay("Mature content confirmed (show on, blur off) before appearance.")
+			} else if skipSetupAgeKey && (mt0.State == "missing" || mt0.State == "disabled") {
+				setupSay("Mature still locked without AgeKey — appearance next; finish mature later.")
+			} else if mt0.On && (mt0.BlurState != "ready" || mt0.BlurOn) {
+				setupSay("Show mature on but blur not off (blur=%s blurOn=%s) — appearance next; fix blur later.",
+					mt0.BlurState, setupFlag(mt0.BlurOn))
+			} else {
+				setupSay("Mature not confirmed (show=%s on=%s blur=%s blurOn=%s) — appearance next anyway.",
+					mt0.State, setupFlag(mt0.On), mt0.BlurState, setupFlag(mt0.BlurOn))
 			}
 		}
 	}
@@ -1282,7 +1448,8 @@ const chromeDismissOverlaysJS = `(() => {
 		if (!c || c.a < 0.35) return false;
 		return c.b > 90 && c.r > 40 && (c.b - c.g) > 25 && c.g < 170;
 	};
-	const blazeish = (t) => /blaze/i.test(t) && !/tumblr premium|get premium now|ad-free|go premium|early (feature )?access|doubled daily limits|tumblrmart/i.test(t);
+	const blazeish = (t) => /blaze|heating up|posts can be blazed|blazed by others/i.test(t) && !/tumblr premium|get premium now|ad-free|go premium|early (feature )?access|doubled daily limits|tumblrmart/i.test(t);
+	const blazeAcceptBtn = /^(awesome news|got it|sounds good|cool|nice|ok(ay)?)$/i;
 	const premiumish = (t) => /tumblr premium|get premium now|ad-free|go premium|early (feature )?access|doubled daily limits|free monthly tumblrmart|billed annually/i.test(t);
 	const premiumSkipBtn = /get premium|go premium|yearly|monthly|save \d+%/i;
 	const closePremium = (root) => {
@@ -1321,12 +1488,15 @@ const chromeDismissOverlaysJS = `(() => {
 		if (closer) { closer.click(); return 'premium-close'; }
 	}
 	const blazePrimary = (root) => {
-		const btns = [...root.querySelectorAll('button, a, [role="button"]')].filter(el => {
-			if (!vis(el)) return false;
+		const all = [...root.querySelectorAll('button, a, [role="button"], div[role="button"]')].filter(vis);
+		// Prefer the explicit primary CTA on the "Things are heating up" Blaze modal.
+		const named = all.find(el => blazeAcceptBtn.test(textOf(el)));
+		if (named) return named;
+		const btns = all.filter(el => {
 			const r = el.getBoundingClientRect();
 			const t = textOf(el);
-			if (r.width < 72 || r.height < 30 || r.height > 84) return false;
-			if (/^×$|^x$|^close$|^dismiss$/i.test(t) || t.length > 80) return false;
+			if (r.width < 72 || r.height < 28 || r.height > 96) return false;
+			if (/^×$|^x$|^close$|^dismiss$|i want to change/i.test(t) || t.length > 80) return false;
 			if (premiumSkipBtn.test(t)) return false;
 			return true;
 		});
@@ -1342,15 +1512,40 @@ const chromeDismissOverlaysJS = `(() => {
 		});
 		return btns[0] || null;
 	};
-	for (const dlg of [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].filter(vis)) {
+	const fire = (el) => {
+		if (!el) return;
+		try { el.focus(); } catch (e) {}
+		const opts = {bubbles:true, cancelable:true, view:window, composed:true};
+		try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({pointerId:1, pointerType:'mouse', isPrimary:true}, opts))); } catch (e) {}
+		try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch (e) {}
+		try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({pointerId:1, pointerType:'mouse', isPrimary:true}, opts))); } catch (e) {}
+		try { el.dispatchEvent(new MouseEvent('mouseup', opts)); } catch (e) {}
+		try { el.dispatchEvent(new MouseEvent('click', opts)); } catch (e) {}
+		try { el.click(); } catch (e) {}
+	};
+	// Fast path: "Awesome news" anywhere (Blaze heating-up modal).
+	{
+		const awesome = buttons.find(b => blazeAcceptBtn.test(textOf(b))) ||
+			[...document.querySelectorAll('button, a, [role="button"], div[role="button"]')].find(el => vis(el) && blazeAcceptBtn.test(textOf(el)));
+		if (awesome && (blazeish(ctxOf(awesome)) || blazeish(pageText) || blazeAcceptBtn.test(textOf(awesome)))) {
+			fire(awesome);
+			return textOf(awesome) || 'blaze-ok';
+		}
+	}
+	const modalRoots = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="modal"], [class*="Modal"], [class*="overlay"], [class*="Overlay"]')].filter(vis);
+	for (const dlg of modalRoots) {
 		const dt = textOf(dlg);
 		if (premiumish(dt) || !blazeish(dt)) continue;
 		const btn = blazePrimary(dlg);
-		if (btn) { btn.click(); return textOf(btn) || 'blaze-ok'; }
+		if (btn) { fire(btn); return textOf(btn) || 'blaze-ok'; }
+		const closer = closePremium(dlg);
+		if (closer) { fire(closer); return 'blaze-close'; }
 	}
 	if (blazeish(pageText) && !premiumish(pageText)) {
 		const btn = blazePrimary(document);
-		if (btn && blazeish(ctxOf(btn))) { btn.click(); return textOf(btn) || 'blaze-ok'; }
+		if (btn) { fire(btn); return textOf(btn) || 'blaze-ok'; }
+		const closer = closePremium(document);
+		if (closer && blazeish(ctxOf(closer))) { fire(closer); return 'blaze-close'; }
 	}
 	for (const el of document.querySelectorAll('[aria-label]')) {
 		if (!vis(el)) continue;
@@ -1509,7 +1704,7 @@ const chromeAppearanceErrorJS = `(() => {
 	return m ? m[0] : '';
 })()`
 
-const chromeMatureToggleStatusJS = `(() => {
+const chromeMatureToggleHelpersJS = `
 	const vis = (el) => {
 		if (!el || !el.getBoundingClientRect) return false;
 		const r = el.getBoundingClientRect();
@@ -1523,21 +1718,35 @@ const chromeMatureToggleStatusJS = `(() => {
 		if (aria === 'true') return true;
 		if (aria === 'false') return false;
 		if (el.type === 'checkbox') return !!el.checked;
-		return !!(el.className && /checked|selected|is-on|isOn/i.test(el.className));
+		const data = (el.getAttribute('data-checked') || el.getAttribute('data-state') || '').toLowerCase();
+		if (data === 'true' || data === 'checked' || data === 'on') return true;
+		if (data === 'false' || data === 'unchecked' || data === 'off') return false;
+		// Tumblr switches: ON is bright blue track; OFF is grey.
+		try {
+			const bg = (getComputedStyle(el).backgroundColor || '').replace(/\s+/g, '');
+			const m = bg.match(/rgba?\((\d+),(\d+),(\d+)/i);
+			if (m) {
+				const r = +m[1], g = +m[2], b = +m[3];
+				if (b > 180 && b > r + 40 && b > g + 20) return true;
+				if (r > 160 && g > 160 && b > 160 && Math.abs(r - g) < 25 && Math.abs(g - b) < 25) return false;
+			}
+		} catch (e) {}
+		return !!(el.className && /checked|selected|is-on|isOn|isActive/i.test(String(el.className)));
 	};
 	const sel = 'button[role="switch"], [role="switch"], input[type=checkbox], [aria-checked], [role="checkbox"], [aria-pressed]';
+	const skipLabel = /two-factor|2fa|password|email|language|birthday|passkey|age.?key|verify age/i;
 	const controlFor = (re) => {
 		const labelled = [...document.querySelectorAll(sel)].find(el => {
 			if (!vis(el)) return false;
 			const meta = (el.getAttribute('aria-label') || textOf(el) || '').toLowerCase();
-			if (/two-factor|2fa|password|email|language|birthday|passkey|age.?key|verify age/i.test(meta)) return false;
+			if (skipLabel.test(meta)) return false;
 			return re.test(el.getAttribute('aria-label') || textOf(el));
 		});
 		if (labelled) return labelled;
 		for (const lab of document.querySelectorAll('label, span, div, p, h2, h3, h4, dt, td, strong, legend, [id]')) {
 			const t = textOf(lab);
 			if (!re.test(t) || t.length > 80) continue;
-			if (/two-factor|2fa|password|email|language|birthday|passkey|age.?key|verify age/i.test(t.toLowerCase())) continue;
+			if (skipLabel.test(t.toLowerCase())) continue;
 			let n = lab;
 			for (let i = 0; i < 8 && n; i++, n = n.parentElement) {
 				const kids = [...n.querySelectorAll(sel)].filter(vis);
@@ -1552,30 +1761,46 @@ const chromeMatureToggleStatusJS = `(() => {
 		}
 		return null;
 	};
-	const show = controlFor(/show mature content/i) ||
+	const findShow = () => controlFor(/show mature content/i) ||
 		controlFor(/^show mature/i) ||
 		controlFor(/show (nsfw|explicit)/i) ||
 		controlFor(/contenido (para adultos|maduro|sensible)/i);
-	if (!show) return JSON.stringify({state:'missing', on:false});
+	const findBlur = () => controlFor(/blur mature content/i) ||
+		controlFor(/blur sensitive( (images|content))?/i) ||
+		controlFor(/blur (nsfw|explicit)/i) ||
+		controlFor(/^blur mature/i) ||
+		controlFor(/blur images/i);
+`
+
+const chromeMatureToggleStatusJS = `(() => {
+` + chromeMatureToggleHelpersJS + `
+	const heading = [...document.querySelectorAll('h1,h2,h3,h4,legend,span,div')].find(el =>
+		vis(el) && /content you see|content labels|mature content|filtering/i.test(textOf(el)) && textOf(el).length < 60);
+	if (heading) try { heading.scrollIntoView({block:'center'}); } catch (e) {}
+	const show = findShow();
+	const blur = findBlur();
+	if (!show) return {state:'missing', on:false, blurOn:false, blurState:'missing'};
 	if (show.disabled || show.getAttribute('aria-disabled') === 'true') {
-		return JSON.stringify({state:'disabled', on:false});
+		return {state:'disabled', on:false, blurOn:false, blurState: blur ? 'disabled' : 'missing'};
 	}
-	return JSON.stringify({state:'ready', on:!!isOn(show)});
+	let blurState = 'missing';
+	let blurOn = false;
+	if (blur) {
+		if (blur.disabled || blur.getAttribute('aria-disabled') === 'true') blurState = 'disabled';
+		else { blurState = 'ready'; blurOn = !!isOn(blur); }
+	}
+	return {state:'ready', on:!!isOn(show), blurOn, blurState};
 })()`
 
 const chromeSetMatureTogglesJS = `(() => {
-	const vis = (el) => {
-		if (!el || !el.getBoundingClientRect) return false;
-		const r = el.getBoundingClientRect();
-		const s = window.getComputedStyle ? getComputedStyle(el) : {};
-		return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
-	};
-	const textOf = (el) => (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') || '').replace(/\s+/g, ' ').trim();
+` + chromeMatureToggleHelpersJS + `
 	const fire = (el) => {
 		if (!el) return;
 		el.scrollIntoView({block:'center', inline:'nearest'});
 		try { el.focus(); } catch (e) {}
-		const opts = {bubbles:true, cancelable:true, view:window, composed:true};
+		const r = el.getBoundingClientRect();
+		const x = r.left + r.width / 2, y = r.top + r.height / 2;
+		const opts = {bubbles:true, cancelable:true, view:window, composed:true, clientX:x, clientY:y};
 		try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({pointerId:1, pointerType:'mouse', isPrimary:true}, opts))); } catch (e) {}
 		try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch (e) {}
 		try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({pointerId:1, pointerType:'mouse', isPrimary:true}, opts))); } catch (e) {}
@@ -1583,72 +1808,37 @@ const chromeSetMatureTogglesJS = `(() => {
 		try { el.dispatchEvent(new MouseEvent('click', opts)); } catch (e) {}
 		try { el.click(); } catch (e) {}
 	};
-	const isOn = (el) => {
-		if (!el) return false;
-		const aria = (el.getAttribute('aria-checked') || el.getAttribute('aria-pressed') || '').toLowerCase();
-		if (aria === 'true') return true;
-		if (aria === 'false') return false;
-		if (el.type === 'checkbox') return !!el.checked;
-		return !!(el.className && /checked|selected|is-on|isOn/i.test(el.className));
-	};
-	const sel = 'button[role="switch"], [role="switch"], input[type=checkbox], [aria-checked], [role="checkbox"], [aria-pressed]';
-	const controlFor = (re) => {
-		const labelled = [...document.querySelectorAll(sel)].find(el => {
-			if (!vis(el)) return false;
-			const meta = (el.getAttribute('aria-label') || textOf(el) || '').toLowerCase();
-			if (/two-factor|2fa|password|email|language|birthday|passkey|age.?key|verify age/i.test(meta)) return false;
-			return re.test(el.getAttribute('aria-label') || textOf(el));
-		});
-		if (labelled) return labelled;
-		for (const lab of document.querySelectorAll('label, span, div, p, h2, h3, h4, dt, td, strong, legend, [id]')) {
-			const t = textOf(lab);
-			if (!re.test(t) || t.length > 80) continue;
-			if (/two-factor|2fa|password|email|language|birthday|passkey|age.?key|verify age/i.test(t.toLowerCase())) continue;
-			let n = lab;
-			for (let i = 0; i < 8 && n; i++, n = n.parentElement) {
-				const kids = [...n.querySelectorAll(sel)].filter(vis);
-				if (kids.length === 1) return kids[0];
-				const lr = lab.getBoundingClientRect();
-				const right = kids.find(el => {
-					const r = el.getBoundingClientRect();
-					return r.left >= lr.right - 24 && Math.abs((r.top + r.bottom) / 2 - (lr.top + lr.bottom) / 2) < 56;
-				});
-				if (right) return right;
-			}
-		}
-		return null;
-	};
-	const heading = [...document.querySelectorAll('h1,h2,h3,h4,legend,span,div')].find(el => vis(el) && /content you see|mature content|filtering/i.test(textOf(el)) && textOf(el).length < 60);
+	const heading = [...document.querySelectorAll('h1,h2,h3,h4,legend,span,div')].find(el =>
+		vis(el) && /content you see|content labels|mature content|filtering/i.test(textOf(el)) && textOf(el).length < 60);
 	if (heading) heading.scrollIntoView({block:'center'});
 	const setWant = (el, wantOn, name) => {
-		if (!el) return name + ':missing';
+		if (!el) return {status: name + ':missing', cx:0, cy:0};
 		const meta = (el.getAttribute('aria-label') || textOf(el) || '').toLowerCase();
-		if (/two-factor|2fa|password|email|language|birthday|passkey|age.?key|verify age/i.test(meta)) {
-			return name + ':missing';
-		}
-		if (el.disabled || el.getAttribute('aria-disabled') === 'true') return name + ':disabled';
-		if (isOn(el) === wantOn) return name + ':' + (wantOn ? 'on' : 'off');
+		if (skipLabel.test(meta)) return {status: name + ':missing', cx:0, cy:0};
+		if (el.disabled || el.getAttribute('aria-disabled') === 'true') return {status: name + ':disabled', cx:0, cy:0};
+		const r = el.getBoundingClientRect();
+		const pt = {cx: r.left + r.width / 2, cy: r.top + r.height / 2};
+		if (isOn(el) === wantOn) return {status: name + ':' + (wantOn ? 'on' : 'off'), cx: pt.cx, cy: pt.cy};
 		fire(el);
 		if (el.type === 'checkbox') {
 			try { el.checked = wantOn; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } catch (e) {}
 		}
-		return name + ':' + (isOn(el) === wantOn ? (wantOn ? 'on' : 'off') : 'clicked');
+		return {status: name + ':' + (isOn(el) === wantOn ? (wantOn ? 'on' : 'off') : 'clicked'), cx: pt.cx, cy: pt.cy};
 	};
-	const show = setWant(
-		controlFor(/show mature content/i) ||
-		controlFor(/^show mature/i) ||
-		controlFor(/show (nsfw|explicit)/i) ||
-		controlFor(/contenido (para adultos|maduro|sensible)/i),
-		true, 'show');
-	const blur = setWant(
-		controlFor(/blur mature content/i) ||
-		controlFor(/blur sensitive( (images|content))?/i) ||
-		controlFor(/blur (nsfw|explicit)/i) ||
-		controlFor(/^blur mature/i) ||
-		controlFor(/blur images/i),
-		false, 'blur');
+	// Desired: Show mature content ON, Blur mature content OFF (Content you see → Content labels).
+	// Turn Show on first — Blur only unlocks after that; re-find before forcing it off.
+	const showHit = setWant(findShow(), true, 'show');
+	let blurEl = findBlur();
+	if (!blurEl || blurEl.disabled || blurEl.getAttribute('aria-disabled') === 'true') {
+		const labels = [...document.querySelectorAll('h1,h2,h3,h4,legend,span,div')].find(el =>
+			vis(el) && /content labels|blur mature/i.test(textOf(el)) && textOf(el).length < 60);
+		if (labels) try { labels.scrollIntoView({block:'center'}); } catch (e) {}
+		blurEl = findBlur();
+	}
+	const blurHit = setWant(blurEl || findBlur(), false, 'blur');
 	try { document.cookie = 'cl_pref=show; path=/; domain=.tumblr.com'; } catch (e) {}
 	let extra = '';
+	const show = showHit.status, blur = blurHit.status;
 	if (/missing|disabled|clicked/.test(show + ' ' + blur)) {
 		extra = ' dump:' + JSON.stringify([...document.querySelectorAll(sel)]
 			.filter(vis)
@@ -1659,7 +1849,15 @@ const chromeSetMatureTogglesJS = `(() => {
 			.find(b => vis(b) && /^(save|save changes)$/i.test(textOf(b)) && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
 		if (save) { fire(save); extra = ' saved'; }
 	}
-	return show + ' ' + blur + extra;
+	return {
+		result: show + ' ' + blur + extra,
+		show: showHit.status,
+		blur: blurHit.status,
+		hits: [
+			showHit.cx > 0 ? {cx: showHit.cx, cy: showHit.cy, kind: 'show'} : null,
+			blurHit.cx > 0 ? {cx: blurHit.cx, cy: blurHit.cy, kind: 'blur'} : null,
+		].filter(Boolean),
+	};
 })()`
 
 const chromeClickAgeConfirmJS = `(() => {
@@ -2156,7 +2354,8 @@ const chromePremiumCloseHitJS = `(() => {
 	};
 	const textOf = (el) => (el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
 	const premiumish = (t) => /tumblr premium|get premium now|ad-free|go premium|early (feature )?access|doubled daily limits|free monthly tumblrmart|billed annually/i.test(t);
-	const blazeish = (t) => /blaze/i.test(t) && !premiumish(t);
+	const blazeish = (t) => /blaze|heating up|posts can be blazed|blazed by others/i.test(t) && !premiumish(t);
+	const blazeAcceptBtn = /^(awesome news|got it|sounds good|cool|nice|ok(ay)?)$/i;
 	const premiumSkipBtn = /get premium|go premium|yearly|monthly|save \d+%/i;
 	const rgbOf = (el) => {
 		const m = (getComputedStyle(el).backgroundColor || '').match(/[\d.]+/g);
@@ -2169,12 +2368,14 @@ const chromePremiumCloseHitJS = `(() => {
 		return c.b > 90 && c.r > 40 && (c.b - c.g) > 25 && c.g < 170;
 	};
 	const blazePrimary = (root) => {
-		const btns = [...root.querySelectorAll('button, a, [role="button"]')].filter(el => {
-			if (!vis(el)) return false;
+		const all = [...root.querySelectorAll('button, a, [role="button"], div[role="button"]')].filter(vis);
+		const named = all.find(el => blazeAcceptBtn.test(textOf(el)));
+		if (named) return named;
+		const btns = all.filter(el => {
 			const r = el.getBoundingClientRect();
 			const t = textOf(el);
-			if (r.width < 72 || r.height < 30 || r.height > 84) return false;
-			if (/^×$|^x$|^close$|^dismiss$/i.test(t) || t.length > 80) return false;
+			if (r.width < 72 || r.height < 28 || r.height > 96) return false;
+			if (/^×$|^x$|^close$|^dismiss$|i want to change/i.test(t) || t.length > 80) return false;
 			if (premiumSkipBtn.test(t)) return false;
 			return true;
 		});
@@ -2230,14 +2431,31 @@ const chromePremiumCloseHitJS = `(() => {
 			return {found: true, text: 'premium-close', x: r.left + r.width / 2, y: r.top + r.height / 2};
 		}
 	}
-	for (const dlg of [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].filter(vis)) {
+	const hitOf = (el, label) => {
+		const r = el.getBoundingClientRect();
+		return {found: true, text: label || textOf(el) || 'blaze-ok', x: r.left + r.width / 2, y: r.top + r.height / 2};
+	};
+	// Fast path: explicit "Awesome news" CTA (heating-up Blaze modal).
+	{
+		const awesome = [...document.querySelectorAll('button, a, [role="button"], div[role="button"]')]
+			.find(el => vis(el) && blazeAcceptBtn.test(textOf(el)));
+		if (awesome) return hitOf(awesome, textOf(awesome) || 'Awesome news');
+	}
+	const modalRoots = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="modal"], [class*="Modal"], [class*="overlay"], [class*="Overlay"]')].filter(vis);
+	for (const dlg of modalRoots) {
 		const dt = textOf(dlg);
 		if (premiumish(dt) || !blazeish(dt)) continue;
 		const el = blazePrimary(dlg);
 		if (!el) continue;
 		el.click();
-		const r = el.getBoundingClientRect();
-		return {found: true, text: textOf(el) || 'blaze-ok', x: r.left + r.width / 2, y: r.top + r.height / 2};
+		return hitOf(el, textOf(el) || 'blaze-ok');
+	}
+	if (blazeish(page) && !premiumish(page)) {
+		const el = blazePrimary(document);
+		if (el) {
+			el.click();
+			return hitOf(el, textOf(el) || 'blaze-ok');
+		}
 	}
 	return {found: false, text: '', x: 0, y: 0};
 })()`
@@ -2334,42 +2552,52 @@ func dismissOverlaysOnPort() {
 	if ageKeyHandsOff() {
 		return
 	}
-	// Prefer fast CDP dismissals. Native UIA walks are capped and only tried once.
-	for i := 0; i < 4; i++ {
-		var overlay string
-		if err := evalOnTumblrPage(chromeDismissOverlaysJS, &overlay); err == nil && overlay != "" {
-			fmt.Println("Dismissed:", overlay)
-			time.Sleep(120 * time.Millisecond)
-			continue
-		}
-		if err := evalOnTumblrPage(chromeClickCookieJS, &overlay); err == nil && overlay != "" {
-			fmt.Println("Dismissed cookies:", overlay)
-			time.Sleep(120 * time.Millisecond)
-			continue
-		}
+	// Sweep every Tumblr tab — Blaze/premium modals often sit on dashboard
+	// while setup is working on settings.
+	for i := 0; i < 5; i++ {
+		hitAny := false
 		if hit := dismissPremiumOnPort(); hit != "" {
 			fmt.Println("Dismissed:", hit)
-			time.Sleep(120 * time.Millisecond)
-			continue
+			hitAny = true
+		}
+		list, _ := listChromeTargets()
+		for _, t := range list {
+			if t.Type != "page" || t.ID == "" {
+				continue
+			}
+			if !strings.Contains(strings.ToLower(t.URL), "tumblr.com") {
+				continue
+			}
+			var overlay string
+			if err := evalJSONOnChromeTarget(t, chromeDismissOverlaysJS, &overlay); err == nil && overlay != "" {
+				fmt.Println("Dismissed:", overlay)
+				hitAny = true
+			}
+			if overlay == "" {
+				if err := evalJSONOnChromeTarget(t, chromeClickCookieJS, &overlay); err == nil && overlay != "" {
+					fmt.Println("Dismissed cookies:", overlay)
+					hitAny = true
+				}
+			}
 		}
 		if i == 0 {
 			if nag := dismissChromeLeakDialog(); nagWasDismissed(nag) {
 				fmt.Println("Dismissed:", nag)
-				time.Sleep(100 * time.Millisecond)
-				continue
+				hitAny = true
 			}
 			if nag := dismissSavePasswordBubble(); nagWasDismissed(nag) {
 				fmt.Println("Dismissed:", nag)
-				time.Sleep(100 * time.Millisecond)
-				continue
+				hitAny = true
 			}
 		}
 		if hit := clickCookieAcceptOnConsentTargets(); hit != "" {
 			fmt.Println("Dismissed cookies:", hit)
-			time.Sleep(120 * time.Millisecond)
-			continue
+			hitAny = true
 		}
-		return
+		if !hitAny {
+			return
+		}
+		time.Sleep(80 * time.Millisecond)
 	}
 }
 
@@ -2694,8 +2922,17 @@ func chromedpNavigateLoggedIn(ctx context.Context, pageURL string) error {
 }
 
 func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
-	if look := lookStatusFromAPI(blogName); look.Complete() {
-		fmt.Println("Name, bio, and avatar already set — still opening appearance to save.")
+	look := currentLookStatus(blogName)
+	needTitle := !look.TitleOK
+	needBio := !look.BioOK
+	// Skip avatar only when page/API says set AND we recorded our upload.
+	needAvatar := !(look.AvatarOK && lookAvatarAppliedByUs())
+	if !needTitle && !needBio && !needAvatar {
+		fmt.Println("Title, bio, and avatar already set by us — skipping re-upload.")
+		return nil
+	}
+	if look.AvatarOK && needAvatar {
+		fmt.Println("Avatar URL looks custom but not recorded as ours — uploading Zoey pic.")
 	}
 	// Banner is applied once in applyBlogLookParts — never here (was double-setting).
 
@@ -2707,9 +2944,14 @@ func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 
 	settings := "https://www.tumblr.com/settings/blog/" + blogName
 	fillJS := chromeFillTitleBioJS(title, desc)
-	avatarAbs, err := imageFromDir(imagePath, profilePicsDir, "profile picture")
-	if err != nil {
-		return err
+	avatarAbs := ""
+	if needAvatar {
+		avatarAbs, err = imageFromDir(imagePath, profilePicsDir, "profile picture")
+		if err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("Avatar already set — not re-uploading the profile pic.")
 	}
 
 	var href, clicked, filled string
@@ -2756,6 +2998,9 @@ func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 		}),
 		chromedp.Location(&href),
 		chromedp.ActionFunc(func(ctx context.Context) error {
+			if !needTitle && !needBio {
+				return nil
+			}
 			dumpChromeControls(ctx, "appearance")
 			dismissChromeNags(ctx)
 			if err := chromedp.Evaluate(fillJS, &filled).Do(ctx); err != nil {
@@ -2767,7 +3012,7 @@ func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 			}
 			return nil
 		}),
-		chromedp.Sleep(1500*time.Millisecond),
+		chromedp.Sleep(800*time.Millisecond),
 	)
 	if err != nil {
 		return err
@@ -2777,7 +3022,7 @@ func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 	}
 	if filled != "" {
 		fmt.Println("Filled:", filled)
-	} else {
+	} else if needTitle || needBio {
 		fmt.Println("Filled: (no title/bio fields)")
 	}
 
@@ -2785,14 +3030,27 @@ func applyBlogLookInChrome(imagePath, blogName, title, desc string) error {
 	if !ok {
 		return fmt.Errorf("no appearance tab after Edit appearance")
 	}
-	if err := setLookImageOnTarget(t, chromeAvatarBoxJS, avatarAbs, "Edit blog avatar image"); err != nil {
-		fmt.Println("Avatar:", err)
-	} else if hit := confirmAvatarAndSaveOnTarget(t); hit != "" {
-		fmt.Println("Clicked:", hit)
+	if needAvatar && avatarAbs != "" {
+		if err := setLookImageOnTarget(t, chromeAvatarBoxJS, avatarAbs, "Edit blog avatar image"); err != nil {
+			fmt.Println("Avatar:", err)
+		} else if hit := confirmAvatarAndSaveOnTarget(t); hit != "" {
+			fmt.Println("Clicked:", hit)
+			markLookAvatarApplied(blogName)
+		} else {
+			// File was set even if save click text was empty — still record attempt after delay.
+			time.Sleep(800 * time.Millisecond)
+			if currentLookStatus(blogName).AvatarOK {
+				markLookAvatarApplied(blogName)
+			}
+		}
+	} else if needTitle || needBio {
+		if hit := confirmAvatarAndSaveOnTarget(t); hit != "" {
+			fmt.Println("Clicked:", hit)
+		}
 	}
 
 	time.Sleep(600 * time.Millisecond)
-	look := lookStatusFromAPI(blogName)
+	look = lookStatusFromAPI(blogName)
 	switch {
 	case look.Complete():
 		fmt.Println("Confirmed name, bio, and avatar.")
@@ -3155,8 +3413,15 @@ func nudgeSetupAccount(st setupPageStatus) setupPageStatus {
 }
 
 func nudgeMatureToggles(t chromeJSONTarget) {
-	var result string
-	if err := evalJSONOnChromeTarget(t, chromeSetMatureTogglesJS, &result); err != nil || result == "" {
+	var applied matureToggleApplyResult
+	if err := evalJSONOnChromeTarget(t, chromeSetMatureTogglesJS, &applied); err != nil {
+		return
+	}
+	result := applied.Result
+	if result == "" {
+		result = strings.TrimSpace(applied.Show + " " + applied.Blur)
+	}
+	if result == "" {
 		return
 	}
 	if strings.Contains(result, ":on") || strings.Contains(result, ":off") || strings.Contains(result, "saved") {
@@ -3395,8 +3660,21 @@ func applyMatureContentInChrome() error {
 }
 
 type matureToggleStatus struct {
-	State string `json:"state"`
-	On    bool   `json:"on"`
+	State     string `json:"state"`
+	On        bool   `json:"on"`
+	BlurOn    bool   `json:"blurOn"`
+	BlurState string `json:"blurState"`
+}
+
+type matureToggleApplyResult struct {
+	Result string `json:"result"`
+	Show   string `json:"show"`
+	Blur   string `json:"blur"`
+	Hits   []struct {
+		CX   float64 `json:"cx"`
+		CY   float64 `json:"cy"`
+		Kind string  `json:"kind"`
+	} `json:"hits"`
 }
 
 func readMatureToggleStatus() matureToggleStatus {
@@ -3414,8 +3692,19 @@ func readMatureToggleStatus() matureToggleStatus {
 	return st
 }
 
+// matureTogglesSucceeded is Show mature ON and Blur mature OFF.
+// Require an explicit blur-off reading — blur:missing / blur:disabled is not success.
+func matureTogglesSucceeded(result string, st matureToggleStatus) bool {
+	showOK := strings.Contains(result, "show:on") || (st.State == "ready" && st.On)
+	if !showOK {
+		return false
+	}
+	// Live status wins: blur control must be ready and off.
+	return st.BlurState == "ready" && !st.BlurOn
+}
+
 func matureShowSucceeded(result string) bool {
-	return strings.Contains(result, "show:on") || strings.Contains(result, "show:already")
+	return matureTogglesSucceeded(result, matureToggleStatus{})
 }
 
 // waitForMatureContentReady polls account settings until Tumblr unlocks the
@@ -3487,6 +3776,7 @@ func applyMatureContentOnPort(port string) error {
 		pages = []string{"https://www.tumblr.com/settings/account"}
 	}
 	var result string
+	var lastSt matureToggleStatus
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		for _, page := range pages {
 			t, err := openOrNavigateTab(page)
@@ -3498,30 +3788,54 @@ func applyMatureContentOnPort(port string) error {
 			_ = evalJSONOnChromeTarget(t, chromeDismissOverlaysJS, &dismiss)
 			mt := matureToggleStatus{}
 			_ = evalJSONOnChromeTarget(t, chromeMatureToggleStatusJS, &mt)
+			lastSt = mt
 			if mt.State == "missing" || mt.State == "disabled" {
 				result = "show:" + mt.State
 				setupSay("Mature content not ready yet (%s) — AgeKey must finish first.", result)
 				continue
 			}
-			if err := evalJSONOnChromeTarget(t, chromeSetMatureTogglesJS, &result); err != nil {
+			// Already correct: Show ON, Blur OFF.
+			if mt.On && (mt.BlurState == "missing" || (mt.BlurState == "ready" && !mt.BlurOn)) {
+				result = "show:on blur:off"
+				setupSay("Mature content already set (show on, blur off).")
+				break
+			}
+			var applied matureToggleApplyResult
+			if err := evalJSONOnChromeTarget(t, chromeSetMatureTogglesJS, &applied); err != nil {
 				return err
+			}
+			result = applied.Result
+			if result == "" {
+				result = strings.TrimSpace(applied.Show + " " + applied.Blur)
 			}
 			fmt.Println("Mature content:", page, result)
 			setupSay("Mature content: %s", result)
-			if matureShowSucceeded(result) {
+			time.Sleep(350 * time.Millisecond)
+			_ = evalJSONOnChromeTarget(t, chromeMatureToggleStatusJS, &mt)
+			lastSt = mt
+			if matureTogglesSucceeded(result, mt) {
+				result = "show:on blur:off"
+				setupSay("Mature content confirmed: show on, blur off")
 				break
 			}
-			if strings.Contains(result, "show:clicked") {
-				time.Sleep(400 * time.Millisecond)
+			// Second JS pass for remaining mismatches (CDP/DOM only — never OS mouse).
+			if err := evalJSONOnChromeTarget(t, chromeSetMatureTogglesJS, &applied); err == nil {
+				result = applied.Result
+				if result == "" {
+					result = strings.TrimSpace(applied.Show + " " + applied.Blur)
+				}
+				time.Sleep(350 * time.Millisecond)
 				_ = evalJSONOnChromeTarget(t, chromeMatureToggleStatusJS, &mt)
-				if mt.State == "ready" && mt.On {
-					result = "show:on"
-					setupSay("Mature content: show:on (confirmed after click)")
+				lastSt = mt
+				if matureTogglesSucceeded(result, mt) {
+					result = "show:on blur:off"
+					setupSay("Mature content confirmed: show on, blur off")
 					break
 				}
 			}
 		}
-		if matureShowSucceeded(result) {
+		if matureTogglesSucceeded(result, lastSt) {
+			result = "show:on blur:off"
 			break
 		}
 		if attempt >= 1 && (strings.Contains(result, "missing") || strings.Contains(result, "disabled")) {
@@ -3532,11 +3846,11 @@ func applyMatureContentOnPort(port string) error {
 		}
 		time.Sleep(600 * time.Millisecond)
 	}
-	if !matureShowSucceeded(result) {
+	if !matureTogglesSucceeded(result, lastSt) {
 		if strings.Contains(result, "show:missing") || strings.Contains(result, "show:disabled") || result == "" {
 			return fmt.Errorf("could not find mature content switches (%s)", result)
 		}
-		return fmt.Errorf("show mature did not turn on (%s)", result)
+		return fmt.Errorf("wanted show on + blur off (%s; show=%v blurOn=%v)", result, lastSt.On, lastSt.BlurOn)
 	}
 	_, _ = openOrNavigateTab("https://www.tumblr.com/settings/account")
 	if cookies, err := cookiesFromDebugPort(); err == nil && cookieValue(cookies, "sid") != "" {

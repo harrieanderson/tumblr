@@ -700,6 +700,68 @@ func TestProxyURLForStickyReadOnly(t *testing.T) {
 	}
 }
 
+func TestEnsureStickyProxyBindsAndReleasesInFlight(t *testing.T) {
+	r := newProxyRouter(testProxyCfg(
+		"http://user:pass@p1.example:8080",
+		"http://user:pass@p2.example:8080",
+	))
+	r.cfg.MinRequestGapMs = 0
+	r.cfg.PerAccountRPM = 1000
+	r.cfg.PerProxyRPM = 1000
+	r.cfg.PerProxyMaxConcurrent = 1
+	r.resetFreshBindCount()
+
+	u, id, err := r.ensureStickyProxy(context.Background(), "watch-acc")
+	if err != nil || u == nil || id == "" {
+		t.Fatalf("ensureStickyProxy: u=%v id=%q err=%v", u, id, err)
+	}
+	if got := r.inflightFor(id); got != 0 {
+		t.Fatalf("browser ensure must release inFlight, got %d", got)
+	}
+	if r.freshBinds() != 1 {
+		t.Fatalf("freshBind=%d want 1", r.freshBinds())
+	}
+	a, ok := r.assign[accountSlug("watch-acc")]
+	if !ok || a.ProxyID != id {
+		t.Fatalf("sticky assign=%#v ok=%v", a, ok)
+	}
+
+	// Second call refreshes sticky, no new bind, still zero inFlight.
+	u2, id2, err := r.ensureStickyProxy(context.Background(), "watch-acc")
+	if err != nil || u2 == nil || id2 != id {
+		t.Fatalf("refresh: u=%v id=%q err=%v want %s", u2, id2, err, id)
+	}
+	if r.freshBinds() != 1 {
+		t.Fatalf("refresh must not re-bind, freshBind=%d", r.freshBinds())
+	}
+	if got := r.inflightFor(id); got != 0 {
+		t.Fatalf("inFlight after refresh=%d", got)
+	}
+}
+
+func TestEnsureStickyProxyCancel(t *testing.T) {
+	r := newProxyRouter(testProxyCfg("http://p1.example:8080"))
+	r.cfg.PerProxyMaxConcurrent = 1
+	r.cfg.MinRequestGapMs = 0
+	r.cfg.PerAccountRPM = 1000
+	r.cfg.PerProxyRPM = 1000
+	held, err := r.acquireLease(context.Background(), "holder")
+	if err != nil || held == "" {
+		t.Fatalf("hold: %v %q", err, held)
+	}
+	defer r.releaseLease(held)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = r.ensureStickyProxy(ctx, "watch-cancel")
+	if err == nil {
+		t.Fatal("expected cancel error while sticky peer saturated")
+	}
+	if _, ok := r.assign[accountSlug("watch-cancel")]; ok {
+		t.Fatal("cancel must not leave sticky for watch-cancel")
+	}
+}
+
 func TestCrossPathNakedProxyURLForDoesNotBind(t *testing.T) {
 	// Paced lease is the only commit path; naked proxyURLFor must not bind
 	// under concurrent pressure with acquireLease.

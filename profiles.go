@@ -129,24 +129,33 @@ func clearBadLogin(id string) {
 	}
 }
 
-// discardDeadLogin only records the rejection. Tumblr shows "incorrect
-// password" for suspicious logins too (new IP, hidden Chrome), so deleting the
-// account's credentials and data on that signal destroyed working accounts.
+// discardDeadLogin removes the account when Tumblr says the email/password is
+// wrong. Credentials go, auth.json is cleared, and the id is noted in
+// discarded-accounts.json (Chrome profile dir left on disk).
 func discardDeadLogin(email string) error {
 	email = strings.TrimSpace(email)
-	if email == "" {
+	id := accountSlug(email)
+	if id == "" {
+		if acc, ok := currentAccount(); ok {
+			email = acc.Email
+			id = acc.ID
+		}
+	}
+	if id == "" {
 		return nil
 	}
-	id := accountSlug(email)
-	fmt.Println("Tumblr rejected the login for", email, "— keeping the account. Check it with: tumblr.exe -login -account", id)
-
-	seen := loadBadLogins()
-	seen[id] = time.Now().Format(time.RFC3339)
-	out, err := json.MarshalIndent(seen, "", "  ")
+	removed, err := removeCredentialByID(id)
 	if err != nil {
-		return err
+		fmt.Println("Could not remove", id, "from credentials:", err)
+	} else if removed != "" {
+		fmt.Println("Discarded", id, "— Tumblr said email/password is wrong. Removed from credentials.json.")
+		email = removed
+	} else {
+		fmt.Println("Discarded", id, "— Tumblr said email/password is wrong.")
 	}
-	return os.WriteFile(badLoginsFile, append(out, '\n'), 0o644)
+	clearAuthSessionFile(id)
+	clearBadLogin(id)
+	return recordDiscardedAccount(id, email, "incorrect_email_or_password")
 }
 
 type discardedAccount struct {
@@ -184,6 +193,34 @@ func recordDiscardedAccount(id, email, reason string) error {
 		return err
 	}
 	return os.WriteFile(discardedAccountsFile, append(raw, '\n'), 0o644)
+}
+
+// removeProfileByID drops an account from the GUI: credentials.json entry gone,
+// session cleared, noted in discarded-accounts.json. Chrome profile data is left
+// on disk (can reclaim later); the account simply stops showing up.
+func removeProfileByID(id string) (email string, err error) {
+	id = accountSlug(id)
+	if id == "" {
+		return "", fmt.Errorf("empty account id")
+	}
+	removed, err := removeCredentialByID(id)
+	if err != nil {
+		return "", err
+	}
+	if removed == "" {
+		if acc, ok := findAccount(id); ok {
+			removed = acc.Email
+		}
+	}
+	if removed == "" {
+		removed = id
+	}
+	clearAuthSessionFile(id)
+	clearBadLogin(id)
+	if err := recordDiscardedAccount(id, removed, "removed_from_gui"); err != nil {
+		return removed, err
+	}
+	return removed, nil
 }
 
 // discardPasswordChangeLogin removes the email from credentials.json — Tumblr
@@ -804,6 +841,7 @@ func peekAccountAuth(id string) Auth {
 
 type accountPublic struct {
 	ID        string `json:"id"`
+	Num       int    `json:"num"` // 1-based label in GUI order (Zoey-first, then followers)
 	Email     string `json:"email"`
 	Enabled   bool   `json:"enabled"`
 	Blog      string `json:"blog"`
@@ -811,6 +849,12 @@ type accountPublic struct {
 	LoggedIn  bool   `json:"loggedIn"`
 	Active    bool   `json:"active"`
 	ZoeySetup bool   `json:"zoeySetup"` // full/essential Zoey look (or on fully-setup list)
+
+	// Session health from auth.json (cookie jar + recovery metadata).
+	NeedsInteractiveLogin bool   `json:"needsInteractiveLogin"`
+	ValidatedAt           string `json:"validatedAt,omitempty"`
+	ProxyID               string `json:"proxyId,omitempty"`
+	RecoveryAttempts      int    `json:"recoveryAttempts,omitempty"`
 }
 
 func publicAccounts() []accountPublic {
@@ -836,14 +880,18 @@ func publicAccountsWithTally() ([]accountPublic, followerTally) {
 		}
 		enabled := a.isEnabled()
 		out = append(out, accountPublic{
-			ID:        a.ID,
-			Email:     a.Email,
-			Enabled:   enabled,
-			Blog:      blog,
-			Followers: followers,
-			LoggedIn:  authHasSID(auth),
-			Active:    a.ID == cur.ID,
-			ZoeySetup: zoey[a.ID],
+			ID:                    a.ID,
+			Email:                 a.Email,
+			Enabled:               enabled,
+			Blog:                  blog,
+			Followers:             followers,
+			LoggedIn:              authHasSID(auth),
+			Active:                a.ID == cur.ID,
+			ZoeySetup:             zoey[a.ID],
+			NeedsInteractiveLogin: auth.NeedsInteractiveLogin,
+			ValidatedAt:           auth.ValidatedAt,
+			ProxyID:               auth.ProxyID,
+			RecoveryAttempts:      auth.RecoveryAttempts,
 		})
 		if enabled && (log.Latest.At != "" || followers > 0) {
 			tally.Total += followers
@@ -852,7 +900,40 @@ func publicAccountsWithTally() ([]accountPublic, followerTally) {
 		}
 	}
 	sortAccountsByFollowers(out)
+	n := 0
+	for i := range out {
+		if !out[i].Enabled {
+			continue
+		}
+		n++
+		out[i].Num = n
+	}
 	return out, tally
+}
+
+// accountLabel returns "#3 id" using the same numbering as the GUI list.
+func accountLabel(id string) string {
+	id = accountSlug(id)
+	if id == "" {
+		return "?"
+	}
+	if n := accountNumber(id); n > 0 {
+		return fmt.Sprintf("#%d %s", n, id)
+	}
+	return id
+}
+
+func accountNumber(id string) int {
+	id = accountSlug(id)
+	if id == "" {
+		return 0
+	}
+	for _, p := range publicAccounts() {
+		if p.ID == id {
+			return p.Num
+		}
+	}
+	return 0
 }
 
 // zoeySetupAccountSet marks accounts that already have the Zoey look
@@ -890,15 +971,15 @@ func zoeySetupAccountSet() map[string]bool {
 	return out
 }
 
-// sortAccountsByFollowers orders GUI accounts by followers desc, then
-// Zoey-setup before not-setup, then account id.
+// sortAccountsByFollowers orders GUI accounts: Zoey-ified first, then
+// followers desc within each group, then account id.
 func sortAccountsByFollowers(accs []accountPublic) {
 	sort.SliceStable(accs, func(i, j int) bool {
-		if accs[i].Followers != accs[j].Followers {
-			return accs[i].Followers > accs[j].Followers
-		}
 		if accs[i].ZoeySetup != accs[j].ZoeySetup {
 			return accs[i].ZoeySetup
+		}
+		if accs[i].Followers != accs[j].Followers {
+			return accs[i].Followers > accs[j].Followers
 		}
 		return strings.ToLower(accs[i].ID) < strings.ToLower(accs[j].ID)
 	})
@@ -936,7 +1017,13 @@ func loginAllAccounts() error {
 			if err != nil {
 				auth = Auth{}
 			}
-			stopChromeFn, err = loginWithRealChromeKeepOpen(&auth)
+			// Headless batch: close after each login (no Enter prompts). Visible
+			// keeps Chrome open so you can inspect before the next account.
+			if headlessChrome {
+				err = loginWithRealChrome(&auth)
+			} else {
+				stopChromeFn, err = loginWithRealChromeKeepOpen(&auth)
+			}
 			if err != nil {
 				stopChromeFn = nil
 				if isBadLogin(err) {
@@ -968,13 +1055,20 @@ func loginAllAccounts() error {
 				}
 			}
 		}
-		if i+1 < len(accs) {
-			waitForEnterNextAccount(accs[i+1].ID, i+2, len(accs))
+		if headlessChrome {
+			if stopChromeFn != nil {
+				stopChromeFn()
+			}
+			time.Sleep(2 * time.Second)
 		} else {
-			waitForEnterNextAccount("", i+2, len(accs))
-		}
-		if stopChromeFn != nil {
-			stopChromeFn()
+			if i+1 < len(accs) {
+				waitForEnterNextAccount(accs[i+1].ID, i+2, len(accs))
+			} else {
+				waitForEnterNextAccount("", i+2, len(accs))
+			}
+			if stopChromeFn != nil {
+				stopChromeFn()
+			}
 		}
 	}
 	fmt.Printf("\nIsolated Tumblr sessions: %d / %d\n", len(seen), len(accs))
@@ -1306,7 +1400,7 @@ func runForAccountsParallel(label string, accs []Account, fn func(Account) error
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			fmt.Printf("\n======== %s: %s (%d/%d) parallel ========\n", label, a.ID, i+1, len(accs))
+			fmt.Printf("\n======== %s: %s (%d/%d) parallel ========\n", label, accountLabel(a.ID), i+1, len(accs))
 			if err := fn(a); err != nil {
 				fmt.Printf("[%s] Error: %v\n", a.ID, err)
 				errMu.Lock()
@@ -1353,7 +1447,7 @@ func runForAccountsParallelLimitedStagger(label string, accs []Account, limit, s
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				fmt.Printf("\n======== %s: %s (%d/%d) parallel ========\n", label, j.a.ID, j.i+1, len(accs))
+				fmt.Printf("\n======== %s: %s (%d/%d) parallel ========\n", label, accountLabel(j.a.ID), j.i+1, len(accs))
 				if err := fn(j.a); err != nil {
 					fmt.Printf("[%s] Error: %v\n", j.a.ID, err)
 					errMu.Lock()
@@ -1417,7 +1511,7 @@ func runForEachAccountList(label string, accs []Account, fn func() error) error 
 	var first error
 	for i := start; i < len(accs); i++ {
 		a := accs[i]
-		fmt.Printf("\n======== %s: %s (%d/%d) ========\n", label, a.ID, i+1, len(accs))
+		fmt.Printf("\n======== %s: %s (%d/%d) ========\n", label, accountLabel(a.ID), i+1, len(accs))
 		if err := setActiveAccount(a.ID); err != nil {
 			fmt.Println(err)
 			if first == nil {
@@ -1456,6 +1550,8 @@ func accountIDsFromFile(path, label string) []Account {
 	if err != nil {
 		return enabledAccounts()
 	}
+	// PowerShell Set-Content -Encoding utf8 writes a UTF-8 BOM; strip it.
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
 	var ids []string
 	if json.Unmarshal(raw, &ids) != nil {
 		var wrap struct {

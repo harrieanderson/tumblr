@@ -89,8 +89,9 @@
   },
   "nsfwReblog": {
     "maxCount": 1,
-    "windowHours": 72,
-    "chance": 0.08
+    "windowHours": 168,
+    "chance": 0.15,
+    "searchQueries": ["nsfw", "lewd", "thirst", "smut", "gay nsfw"]
   },
   "requireActiveDays": 14,
   "seedBlogs": [

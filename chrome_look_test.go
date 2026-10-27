@@ -45,7 +45,7 @@ func TestLoginFillDoesNotPretendSuccess(t *testing.T) {
 			body = body[:len(fn)+j]
 		}
 		if strings.Contains(body, "portInUse(") {
-			t.Fatal(fn + " must not use the 200ms probe — that killed Chrome mid-captcha")
+			t.Fatal(fn + " must not use the 200ms probe â€” that killed Chrome mid-captcha")
 		}
 		if !strings.Contains(body, "portAlive(") {
 			t.Fatal(fn + " must use the patient probe")
@@ -83,6 +83,31 @@ func TestInvisibleRecaptchaDoesNotBlockLoginRefill(t *testing.T) {
 	}
 	if !strings.Contains(string(src), "clickRecaptchaCheckboxIfPresent") {
 		t.Fatal("login must try the I'm-not-a-robot checkbox then wait")
+	}
+	if !strings.Contains(string(src), "withOSRecaptchaClick") {
+		t.Fatal("reCAPTCHA OS mouse must be gated by withOSRecaptchaClick")
+	}
+	if !strings.Contains(string(src), "clickChromePageCSSForced") && !strings.Contains(string(src), "clickScreenXYForced") {
+		t.Fatal("reCAPTCHA click must use a real OS mouse gesture, not CDP-only")
+	}
+	if !strings.Contains(string(src), "clickRecaptchaOnTarget") {
+		t.Fatal("session wait must also auto-click the captcha checkbox")
+	}
+	if !strings.Contains(string(src), "no recaptcha on screen") {
+		t.Fatal("OS mouse path must refuse when I'm-not-a-robot is not visible")
+	}
+	if !strings.Contains(string(src), "captcha not cleared — skipped") {
+		t.Fatal("unsolved captcha must fail-fast so setup moves to the next account")
+	}
+	if strings.Contains(string(src), "waitFor := 3 * time.Minute") {
+		t.Fatal("login captcha must not park for 3 minutes per account")
+	}
+	setupSrc, err := os.ReadFile("profile_setup.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(setupSrc), "clickChromePageCSSForced") || strings.Contains(string(setupSrc), "clickScreenXYForced") {
+		t.Fatal("profile setup must never OS-click (mature/settings/etc) — captcha only")
 	}
 }
 
@@ -263,7 +288,7 @@ func TestCookieRecoveryStartsFreshChrome(t *testing.T) {
 		"ensureFreshChromeForAccount(id)",
 	} {
 		if !strings.Contains(s, need) {
-			t.Fatalf("missing %q — cookie recovery must close leftover Chrome then start fresh", need)
+			t.Fatalf("missing %q â€” cookie recovery must close leftover Chrome then start fresh", need)
 		}
 	}
 	start := strings.Index(s, "func startChromeLoggedInOpts")
@@ -275,10 +300,19 @@ func TestCookieRecoveryStartsFreshChrome(t *testing.T) {
 	if !strings.Contains(body, "ensureFreshChromeForAccount(id)") {
 		t.Fatal("startChromeLoggedInOpts must kill leftover Chrome before launching")
 	}
+	if !strings.Contains(body, "prepareChromeProxyLaunch(") || !strings.Contains(body, "mergeChromeProxyArgs(") {
+		t.Fatal("startChromeLoggedInOpts must launch Chrome through the sticky proxy")
+	}
 	loginStart := strings.Index(s, "func loginChromeSession")
 	loginEnd := strings.Index(s[loginStart+1:], "\nfunc ")
 	loginBody := s[loginStart : loginStart+1+loginEnd]
 	if !strings.Contains(loginBody, "Closing bot Chrome for this profile") {
 		t.Fatal("loginChromeSession must close Chrome after cookie sync")
+	}
+	// Dashboard-ready must still scrape sid â€” wipe/reach recoverSession depends on it.
+	ready := strings.Index(body, "Chrome session ready")
+	scrape := strings.Index(body, "cookiesFromDebugPortTimed")
+	if ready < 0 || scrape < 0 || scrape < ready {
+		t.Fatal("startChromeLoggedInOpts must CDP-sync cookies after Chrome session ready (no skip-sync fast path)")
 	}
 }

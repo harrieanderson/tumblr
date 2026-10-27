@@ -132,11 +132,44 @@ func TestSortAccountsByFollowers(t *testing.T) {
 		{ID: "zoey-high", Followers: 20, ZoeySetup: true},
 	}
 	sortAccountsByFollowers(accs)
-	// Followers desc; same followers → Zoey-setup before not-setup.
-	want := []string{"high", "zoey-high", "mid-a", "mid-b", "low", "zoey-low", "none"}
+	// Zoey-ified first, then followers desc within each group.
+	want := []string{"zoey-high", "mid-a", "zoey-low", "high", "mid-b", "low", "none"}
 	for i, id := range want {
 		if accs[i].ID != id {
 			t.Fatalf("pos %d: got %q want %q", i, accs[i].ID, id)
 		}
+	}
+}
+
+func TestAccountPublicNumAssigned(t *testing.T) {
+	accs := []accountPublic{
+		{ID: "b", Enabled: true, Followers: 1},
+		{ID: "a", Enabled: true, Followers: 5, ZoeySetup: true},
+		{ID: "off", Enabled: false, Followers: 99},
+		{ID: "c", Enabled: true, Followers: 3, ZoeySetup: true},
+	}
+	sortAccountsByFollowers(accs)
+	n := 0
+	for i := range accs {
+		if !accs[i].Enabled {
+			accs[i].Num = 0
+			continue
+		}
+		n++
+		accs[i].Num = n
+	}
+	// Zoey by followers: a(5), c(3); then non-zoey by followers (off=99, b=1).
+	// Disabled keep position but Num stays 0.
+	if accs[0].ID != "a" || accs[0].Num != 1 {
+		t.Fatalf("first zoey got %#v", accs[0])
+	}
+	if accs[1].ID != "c" || accs[1].Num != 2 {
+		t.Fatalf("second zoey got %#v", accs[1])
+	}
+	if accs[2].ID != "off" || accs[2].Num != 0 {
+		t.Fatalf("disabled mid-list got %#v", accs[2])
+	}
+	if accs[3].ID != "b" || accs[3].Num != 3 {
+		t.Fatalf("non-zoey got %#v", accs[3])
 	}
 }

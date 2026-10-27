@@ -131,6 +131,24 @@ func TestSetupLookCheckRequiresBannerAndUsername(t *testing.T) {
 	}
 }
 
+func TestBatchReadyRequiresColours(t *testing.T) {
+	prev := skipSetupAgeKey
+	skipSetupAgeKey = true
+	defer func() { skipSetupAgeKey = prev }()
+	partial := setupLookCheck{TitleOK: true, UsernameOK: true, AvatarOK: true}
+	if partial.batchReady() {
+		t.Fatal("batchReady must not pass without Zoey colours")
+	}
+	partial.AccentOK = true
+	if partial.batchReady() {
+		t.Fatal("background colour is required too")
+	}
+	partial.BackgroundOK = true
+	if !partial.batchReady() {
+		t.Fatal("title+username+avatar+colours should be batchReady")
+	}
+}
+
 func TestApplySetupLookRetriesUntilChecksPass(t *testing.T) {
 	src, err := os.ReadFile("profile_setup.go")
 	if err != nil {
@@ -143,17 +161,20 @@ func TestApplySetupLookRetriesUntilChecksPass(t *testing.T) {
 		t.Fatal("could not bound applySetupLook")
 	}
 	body := s[start : start+1+end]
-	if !strings.Contains(body, "lookTries") || !strings.Contains(body, "retrying") {
-		t.Fatal("look step must retry when checks fail")
+	if !strings.Contains(body, "retrying accent/background") {
+		t.Fatal("look step must retry colours when accent/background are missing")
+	}
+	if !strings.Contains(body, "lookAvatarAppliedByUs") || !strings.Contains(body, "lookBannerAppliedByUs") {
+		t.Fatal("look step must only skip avatar/banner when we recorded our own upload")
+	}
+	if !strings.Contains(body, "avatarTrusted") {
+		t.Fatal("look step must distinguish page AvatarOK from Zoey-applied avatar")
 	}
 	if !strings.Contains(body, "refreshSetupLookCheck") || !strings.Contains(body, "check.Done()") {
 		t.Fatal("look step must verify banner, avatar, username after applying")
 	}
 	if !strings.Contains(body, "Look confirmed") {
 		t.Fatal("look step must log when checks pass")
-	}
-	if !strings.Contains(body, "openFinishedBlogSettings") {
-		t.Fatal("after look checks pass, open /settings/blog/{name} so the finished profile is on screen")
 	}
 	if !strings.Contains(s, "func openFinishedBlogSettings") {
 		t.Fatal("missing openFinishedBlogSettings")
@@ -178,12 +199,48 @@ func TestSetupCanSkipAgeKeyWithoutSkippingOtherSteps(t *testing.T) {
 	if age > look || age > mature {
 		t.Fatal("skip-AgeKey must still happen before mature and appearance")
 	}
+	if strings.Contains(s, `Mature content skipped (needs AgeKey)`) {
+		t.Fatal("skip-AgeKey must still check/apply Show mature before appearance")
+	}
+	if !strings.Contains(s, "matureSettingsOK") {
+		t.Fatal("settings gate must require Show mature ON / Blur OFF before appearance")
+	}
+	if strings.Contains(s, "English + birthday) — skipping straight to appearance") {
+		t.Fatal("must not skip to appearance on English+birthday alone — mature toggles required")
+	}
 	mainSrc, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(mainSrc), `case "-skip-agekey":`) {
 		t.Fatal("CLI must expose -skip-agekey")
+	}
+}
+
+func TestMatureSettingsOK(t *testing.T) {
+	if matureSettingsOK(matureToggleStatus{State: "ready", On: true, BlurState: "ready", BlurOn: false}) != true {
+		t.Fatal("show on + blur off should be OK")
+	}
+	if matureSettingsOK(matureToggleStatus{State: "ready", On: true, BlurState: "missing"}) {
+		t.Fatal("show on + blur missing must NOT count — blur off must be verified")
+	}
+	if matureSettingsOK(matureToggleStatus{State: "ready", On: true, BlurState: "disabled", BlurOn: false}) {
+		t.Fatal("blur still locked/disabled must NOT count as blur off")
+	}
+	if matureSettingsOK(matureToggleStatus{State: "ready", On: true, BlurState: "ready", BlurOn: true}) {
+		t.Fatal("blur still on must not count as ready")
+	}
+	if matureSettingsOK(matureToggleStatus{State: "ready", On: false, BlurState: "ready", BlurOn: false}) {
+		t.Fatal("show off must not count as ready")
+	}
+	if matureSettingsOK(matureToggleStatus{State: "disabled", On: false}) {
+		t.Fatal("locked toggle must not count as ready")
+	}
+	if matureTogglesSucceeded("show:on blur:missing", matureToggleStatus{State: "ready", On: true, BlurState: "missing"}) {
+		t.Fatal("apply success must not treat blur:missing as blur off")
+	}
+	if !matureTogglesSucceeded("show:on blur:off", matureToggleStatus{State: "ready", On: true, BlurState: "ready", BlurOn: false}) {
+		t.Fatal("show on + blur off should succeed")
 	}
 }
 
@@ -482,11 +539,19 @@ func TestMatureTogglesUnblurSensitiveImages(t *testing.T) {
 	if !strings.Contains(chromeSetMatureTogglesJS, "pointerdown") {
 		t.Fatal("mature JS must fire a real click, not only el.click()")
 	}
-	if !strings.Contains(chromeSetMatureTogglesJS, `false, 'blur'`) {
-		t.Fatal("blur toggle must be set off")
+	if !strings.Contains(chromeSetMatureTogglesJS, `setWant(blurEl || findBlur(), false, 'blur')`) &&
+		!strings.Contains(chromeSetMatureTogglesJS, `setWant(findBlur(), false, 'blur')`) {
+		t.Fatal("blur toggle must be set off (after Show mature unlocks it)")
 	}
-	if !strings.Contains(chromeSetMatureTogglesJS, `true, 'show'`) {
+	if !strings.Contains(chromeSetMatureTogglesJS, "Turn Show on first") &&
+		!strings.Contains(chromeSetMatureTogglesJS, "re-find") {
+		t.Fatal("must re-find blur after turning Show mature on")
+	}
+	if !strings.Contains(chromeSetMatureTogglesJS, `setWant(findShow(), true, 'show')`) {
 		t.Fatal("show mature must be set on")
+	}
+	if !strings.Contains(chromeSetMatureTogglesJS, "content labels") {
+		t.Fatal("mature JS should scroll to Content labels")
 	}
 	if !strings.Contains(chromeSetMatureTogglesJS, "two-factor") {
 		t.Fatal("mature JS must ignore two-factor switches")

@@ -57,9 +57,9 @@ const guiHTML = `<!DOCTYPE html>
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)' opacity='.55'/></svg>");
   }
   .app {
-    max-width: 1280px;
+    max-width: 1440px;
     margin: 0 auto;
-    padding: 22px 22px 28px;
+    padding: 28px 28px 36px;
   }
   .topbar {
     display: flex;
@@ -174,19 +174,26 @@ const guiHTML = `<!DOCTYPE html>
   }
   .layout {
     display: grid;
-    grid-template-columns: 340px 1fr;
-    gap: 14px;
+    grid-template-columns: minmax(420px, 460px) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
   }
-  @media (max-width: 920px) { .layout { grid-template-columns: 1fr; } }
+  @media (max-width: 980px) {
+    .layout { grid-template-columns: 1fr; }
+  }
   .card {
     position: relative;
     background: var(--panel);
     border: 1px solid var(--line);
-    border-radius: 22px;
-    padding: 16px 16px 15px;
+    border-radius: 26px;
+    padding: 18px 18px 16px;
     box-shadow: var(--shadow);
     backdrop-filter: blur(22px);
     overflow: hidden;
+  }
+  .card.accounts-panel {
+    padding: 18px 16px 16px;
+    min-width: 0;
   }
   .card::before {
     content: "";
@@ -214,12 +221,6 @@ const guiHTML = `<!DOCTYPE html>
   .field { display: flex; flex-direction: column; gap: 5px; min-width: 88px; }
   .field.grow { flex: 1; min-width: 140px; }
   .field > label, .lbl { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
-  .acct label.grow {
-    text-transform: none;
-    letter-spacing: 0;
-    font-size: 13px;
-    color: var(--ink);
-  }
   input[type="text"], input[type="number"], select, textarea {
     width: 100%;
     background: rgba(0,0,0,.28);
@@ -260,46 +261,134 @@ const guiHTML = `<!DOCTYPE html>
   }
   button.ghost:hover { border-color: rgba(232,213,181,.35); background: rgba(255,255,255,.05); }
   button:disabled { opacity: 0.38; cursor: not-allowed; transform: none; filter: none; }
+  .acct-head {
+    margin-bottom: 12px;
+  }
+  .acct-head .hint { margin: 6px 0 0; }
+  .acct-toolbar { margin: 0 0 10px; }
   .acct-tools { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
   .acct-list {
-    height: 348px;
+    height: min(62vh, 580px);
     overflow: auto;
     background: rgba(0,0,0,.22);
     border: 1px solid var(--line);
-    border-radius: 16px;
-    padding: 6px;
+    border-radius: 18px;
+    padding: 8px;
   }
-  .acct-list::-webkit-scrollbar { width: 8px; }
-  .acct-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 99px; }
+  .acct-list::-webkit-scrollbar { width: 10px; }
+  .acct-list::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,.12);
+    border-radius: 99px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  .acct-divider {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin: 18px 12px 12px;
+    font-size: 11px;
+    letter-spacing: .24em;
+    text-transform: uppercase;
+  }
+  .acct-divider:first-child { margin-top: 6px; }
+  .acct-divider::before,
+  .acct-divider::after {
+    content: "";
+    height: 1px;
+    flex: 1;
+    background: linear-gradient(90deg, transparent, rgba(232,213,181,.28), transparent);
+  }
+  .acct-divider span {
+    color: var(--gold);
+    white-space: nowrap;
+  }
+  .acct-divider.needs::before,
+  .acct-divider.needs::after {
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.1), transparent);
+  }
+  .acct-divider.needs span { color: var(--muted); }
   .acct {
-    display: flex;
+    position: relative;
+    display: grid;
+    grid-template-columns: 18px 40px minmax(0, 1fr) auto;
     align-items: center;
-    gap: 8px;
-    padding: 8px 8px;
-    border-radius: 14px;
-    margin-bottom: 2px;
+    column-gap: 12px;
+    padding: 12px 12px 12px 14px;
+    border-radius: 16px;
+    margin-bottom: 6px;
+    border: 1px solid rgba(255,255,255,.05);
+    background: rgba(255,255,255,.025);
+    transition: background .18s ease, border-color .18s ease;
   }
-  .acct:hover { background: rgba(196, 181, 253, .07); }
-  .acct .grow { flex: 1; min-width: 0; }
-  .acct label.grow {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    cursor: pointer;
-    color: var(--ink);
+  .acct:hover {
+    background: rgba(196, 181, 253, .07);
+    border-color: rgba(232, 213, 181, .18);
   }
-  .acct input { accent-color: #c4b5fd; }
+  .acct.is-zoey {
+    background: linear-gradient(105deg, rgba(232, 213, 181, .08), rgba(255,255,255,.02) 50%);
+    border-color: rgba(232, 213, 181, .14);
+  }
+  .acct.is-zoey::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 11px;
+    bottom: 11px;
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: linear-gradient(180deg, #f4ead8, #c4b5fd);
+  }
+  .acct input {
+    accent-color: #c4b5fd;
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    justify-self: center;
+  }
   .avatar {
-    flex: 0 0 32px;
-    width: 32px;
-    height: 32px;
-    border-radius: 11px;
+    width: 40px;
+    height: 40px;
+    border-radius: 13px;
     display: grid;
     place-items: center;
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 700;
     color: #1b1227;
-    background: linear-gradient(160deg, #e8d5b5, #c4b5fd);
+    background: linear-gradient(160deg, #f3e7d3 0%, #e8d5b5 42%, #c4b5fd 100%);
+    box-shadow: 0 6px 16px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.55);
+    cursor: pointer;
+  }
+  .acct-body {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    cursor: pointer;
+  }
+  .acct-title {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+  }
+  .acct-num {
+    flex: 0 0 auto;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    color: var(--gold);
+    opacity: .9;
+  }
+  .acct-title strong {
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 620;
+    letter-spacing: -.02em;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .acct .meta {
     color: var(--muted);
@@ -307,33 +396,164 @@ const guiHTML = `<!DOCTYPE html>
     display: flex;
     align-items: center;
     gap: 6px;
-    margin-top: 1px;
+    flex-wrap: nowrap;
+    min-width: 0;
+    overflow: hidden;
   }
+  .acct .meta > span:not(.dot):not(.sep):not(.chip) {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .acct .meta .sep {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: rgba(255,255,255,.28);
+    flex: 0 0 auto;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 9px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    border: 1px solid var(--line);
+    background: rgba(255,255,255,.04);
+    color: var(--muted);
+  }
+  .chip.zoey {
+    color: #1a1224;
+    border-color: transparent;
+    background: linear-gradient(180deg, #f4ead8, #e8d5b5);
+    font-weight: 700;
+  }
+  .chip.fol {
+    color: var(--ink);
+    border-color: rgba(255,255,255,.08);
+    letter-spacing: .04em;
+    text-transform: none;
+    font-size: 10px;
+  }
+  .chip.need {
+    color: var(--danger);
+    border-color: rgba(251, 113, 133, .35);
+    background: rgba(251, 113, 133, .08);
+  }
+  .chip.ok-sess {
+    color: var(--ok);
+    border-color: rgba(94, 234, 212, .28);
+    background: rgba(94, 234, 212, .06);
+  }
+  .job-pill {
+    display: none;
+    max-width: 280px;
+    padding: 8px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--line);
+    background: rgba(255,255,255,.03);
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: .04em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .job-pill.on { display: block; color: var(--gold); border-color: var(--line2); }
+  .btn-stop {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid rgba(251, 113, 133, .45);
+    box-shadow: none;
+  }
+  .btn-stop:hover {
+    background: rgba(251, 113, 133, .12);
+    border-color: rgba(251, 113, 133, .7);
+  }
+  .btn-stop:disabled { opacity: .35; }
   .dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
     background: #6b6578;
+    flex: 0 0 auto;
   }
   .dot.live { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-  .acct .btn-open-one {
+  .acct-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: stretch;
     flex: 0 0 auto;
-    padding: 6px 10px;
-    font-size: 11px;
-    letter-spacing: .08em;
-    text-transform: uppercase;
-    background: rgba(255,255,255,.03);
-    color: var(--gold);
-    border: 1px solid var(--line2);
-    box-shadow: none;
+    justify-self: end;
+    min-width: 76px;
   }
-  .count { margin-top: 10px; color: var(--muted); font-size: 12px; }
+  .acct .btn-open-one {
+    padding: 7px 10px;
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    box-shadow: none;
+    white-space: nowrap;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--gold);
+    border: 1px solid rgba(232, 213, 181, .3);
+  }
+  .acct .btn-open-one:hover {
+    background: rgba(232, 213, 181, .1);
+    border-color: rgba(232, 213, 181, .5);
+  }
+  .acct .btn-rm {
+    width: 100%;
+    height: 26px;
+    padding: 0;
+    border-radius: 9px;
+    font-size: 15px;
+    line-height: 1;
+    letter-spacing: 0;
+    text-transform: none;
+    box-shadow: none;
+    flex: 0 0 auto;
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid transparent;
+    opacity: .4;
+  }
+  .acct:hover .btn-rm,
+  .acct .btn-rm.armed { opacity: 1; }
+  .acct .btn-rm:hover {
+    color: var(--ink);
+    border-color: var(--line);
+    background: rgba(255,255,255,.04);
+  }
+  .acct .btn-rm.armed {
+    color: var(--danger);
+    border-color: rgba(248, 113, 113, .5);
+    background: rgba(248, 113, 113, .1);
+    font-weight: 700;
+  }
+  .acct-foot {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .count { margin: 0; color: var(--muted); font-size: 12px; }
   .grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 14px;
   }
-  @media (max-width: 720px) { .grid { grid-column: 1 / -1; grid-template-columns: 1fr; } }
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: 1fr; }
+  }
   .span-all { grid-column: 1 / -1; }
   .hero {
     display: flex;
@@ -400,10 +620,11 @@ const guiHTML = `<!DOCTYPE html>
       <div>
         <div class="brand-kicker">Studio</div>
         <h1>Zoey</h1>
-        <p class="sub">Pick accounts, then run setup, reach, posts, or DMs.</p>
+        <p class="sub">Local control panel over real Chrome profiles — not an embedded Tumblr login.</p>
       </div>
     </div>
     <div class="top-right">
+      <div id="jobPill" class="job-pill" title="Active job"></div>
       <div id="tally" class="tally">
         <div class="tally-new zero" id="tallyNew">+0</div>
         <div>
@@ -412,16 +633,19 @@ const guiHTML = `<!DOCTYPE html>
         </div>
       </div>
       <label class="check" title="Bot Chrome stays hidden, including logins. Captchas can't be solved while this is on."><input id="headless" type="checkbox" /> Hide Chrome</label>
+      <button type="button" id="btnStop" class="btn-stop" data-keep="1" disabled title="Cancel the current job after in-flight work">Stop</button>
       <div id="status" class="status"><i></i><span id="statusText">Idle</span></div>
     </div>
   </div>
 
   <div class="layout">
-    <section class="card">
-      <h2>Accounts</h2>
-      <p class="hint">Tick blogs for a job. Watch opens that profile in Chrome.</p>
-      <div class="row">
-        <div class="field grow">
+    <section class="card accounts-panel">
+      <div class="acct-head">
+        <h2>Accounts</h2>
+        <p class="hint">Zoey-ready first, then by followers.</p>
+      </div>
+      <div class="acct-toolbar">
+        <div class="field grow" style="margin:0">
           <label for="acctFilter">Filter</label>
           <input id="acctFilter" type="text" placeholder="name, email, blog" />
         </div>
@@ -429,20 +653,20 @@ const guiHTML = `<!DOCTYPE html>
       <div class="acct-tools">
         <button type="button" id="btnSelectAll" data-keep="1">Select all</button>
         <button type="button" id="btnSelectNone" class="ghost" data-keep="1">None</button>
-        </div>
-      <div class="acct-tools" role="group" aria-label="Select top accounts by followers">
         <button type="button" id="btnTopMinus10" class="ghost" data-keep="1" aria-label="Decrease top count by 10">−10</button>
         <button type="button" id="btnTopMinus1" class="ghost" data-keep="1" aria-label="Decrease top count by 1">−1</button>
         <button type="button" id="btnSelect20" data-keep="1">Select top 20</button>
         <button type="button" id="btnTopPlus1" class="ghost" data-keep="1" aria-label="Increase top count by 1">+1</button>
         <button type="button" id="btnTopPlus10" class="ghost" data-keep="1" aria-label="Increase top count by 10">+10</button>
       </div>
-      <p class="hint">List order: most followers first; same count → Zoey-setup above not-setup. Top N uses that order.</p>
       <div id="acctList" class="acct-list"></div>
-      <div id="acctCount" class="count">0 selected</div>
-      <div class="acct-tools" style="margin-top:12px;margin-bottom:0">
-        <button type="button" id="btnLogin">Login selected</button>
-        <button type="button" id="btnOpenChrome" class="ghost" data-keep="1">Open Chrome</button>
+      <div class="acct-foot">
+        <div id="acctCount" class="count">0 selected</div>
+        <div class="acct-tools" style="margin:0">
+          <button type="button" id="btnLogin">Login selected</button>
+          <button type="button" id="btnRecover" class="ghost" title="Open Chrome for accounts that need captcha/login">Recover</button>
+          <button type="button" id="btnOpenChrome" class="ghost" data-keep="1">Open Chrome</button>
+        </div>
       </div>
     </section>
 
@@ -468,7 +692,7 @@ const guiHTML = `<!DOCTYPE html>
           </div>
           <div class="field">
             <label for="reachParallel">At a time</label>
-            <input id="reachParallel" type="number" min="1" max="40" value="10" />
+            <input id="reachParallel" type="number" min="1" max="8" value="4" title="Capped at 8 — Chrome/Tumblr rate limits dominate" />
           </div>
           <div class="field">
             <label for="followCount">Follows each</label>
@@ -625,11 +849,11 @@ function escapeHtml(s) {
 
 function accountsByFollowers() {
   return accountsCache.slice().sort(function (a, b) {
-    const df = (b.followers || 0) - (a.followers || 0);
-    if (df !== 0) return df;
     const az = a.zoeySetup ? 1 : 0;
     const bz = b.zoeySetup ? 1 : 0;
-    if (az !== bz) return bz - az; // Zoey-setup before not-setup
+    if (az !== bz) return bz - az; // Zoey-ified at the top
+    const df = (b.followers || 0) - (a.followers || 0);
+    if (df !== 0) return df;
     return String(a.id || "").toLowerCase().localeCompare(String(b.id || "").toLowerCase());
   });
 }
@@ -637,30 +861,64 @@ function accountsByFollowers() {
 function renderAccountList() {
   const q = (acctFilter.value || "").toLowerCase().trim();
   const html = [];
+  let sawZoey = false;
+  let sawRest = false;
   accountsByFollowers().forEach(function (a) {
     if (!a.enabled) return;
     const hay = ((a.id || "") + " " + (a.email || "") + " " + (a.blog || "")).toLowerCase();
     if (q && hay.indexOf(q) < 0) return;
-    const mark = a.loggedIn ? "logged in" : "needs login";
+    if (a.zoeySetup && !sawZoey) {
+      sawZoey = true;
+      html.push('<div class="acct-divider"><span>Zoey ready</span></div>');
+    }
+    if (!a.zoeySetup && !sawRest) {
+      sawRest = true;
+      html.push('<div class="acct-divider needs"><span>Needs setup</span></div>');
+    }
+    let mark = a.loggedIn ? "Logged in" : "Needs login";
+    if (a.needsInteractiveLogin) mark = "Needs human";
     const title = a.blog ? "@" + a.blog : a.id;
-    const extra = a.blog ? " · " + a.id : "";
-    const fol = a.followers ? " · " + a.followers + " followers" : "";
-    const zoey = a.zoeySetup ? " · Zoey" : "";
+    const num = a.num > 0 ? a.num : "";
+    const tip = (num ? "#" + num + " · " : "") + (a.blog ? (title + " · " + a.id) : title) +
+      (a.proxyId ? " · proxy " + a.proxyId : "") +
+      (a.validatedAt ? " · ok " + a.validatedAt : "");
     const checked = selectedIds[a.id] ? " checked" : "";
     const initial = escapeHtml(((a.blog || a.id || "?").replace(/^@/, "").charAt(0) || "?").toUpperCase());
-    const live = a.loggedIn ? " live" : "";
+    const live = (a.loggedIn && !a.needsInteractiveLogin) ? " live" : "";
+    const zoeyClass = a.zoeySetup ? " is-zoey" : "";
+    const cid = "acct-" + escapeHtml(a.id);
+    const numBit = num ? '<span class="acct-num">#' + num + '</span>' : "";
+    const metaBits = [
+      '<span class="dot' + live + '"></span>',
+      '<span>' + mark + '</span>'
+    ];
+    if (a.needsInteractiveLogin) {
+      metaBits.push('<span class="chip need">Recover</span>');
+    } else if (a.loggedIn && a.validatedAt) {
+      metaBits.push('<span class="chip ok-sess">OK</span>');
+    }
+    if (a.followers) {
+      metaBits.push('<span class="chip fol">' + escapeHtml(String(a.followers)) + '</span>');
+    }
+    if (a.zoeySetup) {
+      metaBits.push('<span class="chip zoey">Zoey</span>');
+    }
     html.push(
-      '<div class="acct">' +
-        '<label class="grow">' +
-          '<input type="checkbox" data-id="' + escapeHtml(a.id) + '"' + checked + ' />' +
-          '<span class="avatar">' + initial + '</span>' +
-          '<span><strong>' + escapeHtml(title) + '</strong><div class="meta"><span class="dot' + live + '"></span>' + mark + escapeHtml(extra + fol + zoey) + '</div></span>' +
+      '<div class="acct' + zoeyClass + '" title="' + escapeHtml(tip) + '">' +
+        '<input id="' + cid + '" type="checkbox" data-id="' + escapeHtml(a.id) + '"' + checked + ' />' +
+        '<label class="avatar" for="' + cid + '">' + initial + '</label>' +
+        '<label class="acct-body" for="' + cid + '">' +
+          '<div class="acct-title">' + numBit + '<strong>' + escapeHtml(title) + '</strong></div>' +
+          '<div class="meta">' + metaBits.join('') + '</div>' +
         '</label>' +
-        '<button type="button" class="btn-open-one" data-id="' + escapeHtml(a.id) + '" data-keep="1">Watch</button>' +
+        '<div class="acct-actions">' +
+          '<button type="button" class="btn-open-one" data-id="' + escapeHtml(a.id) + '" data-keep="1">Watch</button>' +
+          '<button type="button" class="btn-rm" data-id="' + escapeHtml(a.id) + '" data-keep="1" title="Remove profile" aria-label="Remove profile">−</button>' +
+        '</div>' +
       '</div>'
     );
   });
-  acctList.innerHTML = html.join("") || '<div class="acct">No accounts match.</div>';
+  acctList.innerHTML = html.join("") || '<div class="acct" style="display:flex;justify-content:center;color:var(--muted)">No accounts match.</div>';
   acctList.querySelectorAll("input[type=checkbox]").forEach(function (box) {
     box.onchange = function () {
       selectedIds[box.getAttribute("data-id")] = box.checked;
@@ -672,6 +930,25 @@ function renderAccountList() {
       ev.preventDefault();
       ev.stopPropagation();
       openChromeFor(btn.getAttribute("data-id"));
+    };
+  });
+  acctList.querySelectorAll(".btn-rm").forEach(function (btn) {
+    btn.onclick = function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (!btn.classList.contains("armed")) {
+        acctList.querySelectorAll(".btn-rm.armed").forEach(function (other) {
+          other.classList.remove("armed");
+          other.textContent = "−";
+        });
+        btn.classList.add("armed");
+        btn.textContent = "×";
+        return;
+      }
+      removeAccounts([btn.getAttribute("data-id")]).then(function () {
+        btn.classList.remove("armed");
+        btn.textContent = "−";
+      });
     };
   });
   updateCount();
@@ -744,17 +1021,25 @@ function appendLog(line) {
   const row = document.createElement("div");
   row.className = "log-line";
   if (/Error:/.test(line)) row.classList.add("err");
-  else if (/Done\./.test(line)) row.classList.add("ok");
-  else if (/Starting:/.test(line)) row.classList.add("go");
+  else if (/Done\.|Stopped\./.test(line)) row.classList.add("ok");
+  else if (/Starting:|Emergency stop/.test(line)) row.classList.add("go");
   row.textContent = line;
   logEl.appendChild(row);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function setBusy(busy) {
+function setBusy(busy, job) {
   statusText.textContent = busy ? "Running" : "Idle";
   statusEl.classList.toggle("on", !!busy);
   document.body.classList.toggle("is-busy", !!busy);
+  const pill = document.getElementById("jobPill");
+  if (pill) {
+    const label = (job || "").trim();
+    pill.textContent = label || "";
+    pill.classList.toggle("on", !!busy && !!label);
+  }
+  const stopBtn = document.getElementById("btnStop");
+  if (stopBtn) stopBtn.disabled = !busy;
   buttons.forEach(function (b) {
     if (b.getAttribute("data-keep") === "1") return;
     b.disabled = busy;
@@ -765,7 +1050,7 @@ async function pollBusy() {
   try {
     const r = await fetch("/api/status");
     const j = await r.json();
-    setBusy(!!j.busy);
+    setBusy(!!j.busy, j.job || "");
     applyTally(j.tally);
     document.getElementById("headless").checked = !!j.headless;
   } catch (_) {}
@@ -782,7 +1067,7 @@ document.getElementById("headless").onchange = function (e) {
 const es = new EventSource("/api/events");
 es.onmessage = function (e) {
   appendLog(e.data);
-  if (/\\] (Starting:|Done\\.|Error:)/.test(e.data)) {
+  if (/\\] (Starting:|Done\\.|Stopped\\.|Error:|Emergency stop)/.test(e.data)) {
     pollBusy();
     loadAccounts();
   }
@@ -827,6 +1112,59 @@ document.getElementById("btnTopPlus10").onclick = function () { adjustTopCount(1
 acctFilter.oninput = renderAccountList;
 
 document.getElementById("btnLogin").onclick = function () { postJSON("/api/login", {}); };
+document.getElementById("btnRecover").onclick = function () { postJSON("/api/recover", {}); };
+document.getElementById("btnStop").onclick = async function () {
+  try {
+    const r = await fetch("/api/stop", { method: "POST" });
+    if (!r.ok) {
+      appendLog("Stop failed: " + (await r.text()));
+      return;
+    }
+    appendLog("Emergency stop requested.");
+    pollBusy();
+  } catch (e) {
+    appendLog("Stop failed: " + e);
+  }
+};
+
+async function removeAccounts(ids) {
+  ids = (ids || []).filter(Boolean);
+  if (!ids.length) {
+    appendLog("Select at least one account to remove.");
+    return;
+  }
+  let label = ids.length + " accounts";
+  if (ids.length === 1) {
+    const hit = accountsCache.find(function (a) { return a.id === ids[0]; });
+    label = hit && hit.blog ? "@" + hit.blog : ids[0];
+  }
+  if (!window.confirm("Are you sure?\n\nRemove " + label + " from the GUI?\n\nThis deletes the login from credentials.json. Chrome profile folders stay on disk.")) {
+    return;
+  }
+  try {
+    const r = await fetch("/api/remove-accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountIds: ids })
+    });
+    const j = await r.json().catch(function () { return {}; });
+    if (!r.ok) {
+      appendLog("Remove failed: " + (j.error || r.statusText || r.status));
+      return;
+    }
+    (j.removed || ids).forEach(function (id) { delete selectedIds[id]; });
+    if (j.accounts) {
+      accountsCache = j.accounts;
+      applyTally(j.tally);
+      renderAccountList();
+    } else {
+      await loadAccounts();
+    }
+    appendLog("Removed " + ((j.removed && j.removed.length) || ids.length) + " profile(s).");
+  } catch (e) {
+    appendLog("Remove failed: " + e);
+  }
+}
 
 document.getElementById("btnOpenChrome").onclick = async function () {
   const ids = selectedAccountIds();
@@ -864,7 +1202,7 @@ document.getElementById("btnSetupSkip").onclick = async function () {
 document.getElementById("btnReach").onclick = function () {
   postJSON("/api/follow", {
     minutes: +document.getElementById("reachMinutes").value || 90,
-    parallel: +document.getElementById("reachParallel").value || 10,
+    parallel: +document.getElementById("reachParallel").value || 4,
     maxFollows: +document.getElementById("followCount").value,
     likePosts: +document.getElementById("likePosts").value
   });
@@ -873,7 +1211,7 @@ document.getElementById("btnReach").onclick = function () {
 document.getElementById("btnReachMid").onclick = function () {
   postJSON("/api/reach-mid-replies", {
     minutes: +document.getElementById("reachMinutes").value || 90,
-    parallel: +document.getElementById("reachParallel").value || 10,
+    parallel: +document.getElementById("reachParallel").value || 4,
     maxFollows: +document.getElementById("followCount").value,
     likePosts: +document.getElementById("likePosts").value,
     all: true,

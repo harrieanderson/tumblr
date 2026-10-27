@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -195,15 +196,39 @@ func pinBlogPostOnce(client *http.Client, auth *Auth, blog, postID string) error
 // duplicate video post.
 const newPinnedScanPosts = 600
 
-// findNewPinnedCaptionPost looks for the redo pinned intro already on the blog.
+// findNewPinnedCaptionPost looks for the Zoey pinned intro already on the blog.
+// Prefers an already-pinned match; extras are duplicate intros to delete.
 func findNewPinnedCaptionPost(client *http.Client, auth Auth, blog string) (id string, alreadyPinned bool, err error) {
-	for offset := 0; offset < newPinnedScanPosts; offset += 20 {
+	id, alreadyPinned, _, err = findNewPinnedCaptionPostsLimit(client, auth, blog, newPinnedScanPosts)
+	return id, alreadyPinned, err
+}
+
+// findNewPinnedCaptionPostLimit scans at most maxPosts (fast path uses a shallow
+// scan so we can skip Chrome login when the pin is already there).
+func findNewPinnedCaptionPostLimit(client *http.Client, auth Auth, blog string, maxPosts int) (id string, alreadyPinned bool, err error) {
+	id, alreadyPinned, _, err = findNewPinnedCaptionPostsLimit(client, auth, blog, maxPosts)
+	return id, alreadyPinned, err
+}
+
+// findNewPinnedCaptionPostsLimit returns the keep candidate (pinned preferred),
+// whether that candidate is pinned, and any extra duplicate intro post IDs.
+func findNewPinnedCaptionPostsLimit(client *http.Client, auth Auth, blog string, maxPosts int) (keepID string, keepPinned bool, extras []string, err error) {
+	if maxPosts <= 0 {
+		maxPosts = newPinnedScanPosts
+	}
+	var ids []string
+	var pinnedID string
+	seen := map[string]bool{}
+	for offset := 0; offset < maxPosts; offset += 20 {
 		posts, err := fetchBlogPostsPage(client, &auth, blog, 20, offset)
 		if err != nil {
-			if offset > 0 {
-				return "", false, fmt.Errorf("scan for existing pinned post stopped at %d: %w", offset, err)
+			if offset > 0 && len(ids) > 0 {
+				break // keep what we found; extras cleanup can still run
 			}
-			return "", false, err
+			if offset > 0 {
+				return "", false, nil, fmt.Errorf("scan for existing pinned post stopped at %d: %w", offset, err)
+			}
+			return "", false, nil, err
 		}
 		if len(posts) == 0 {
 			break
@@ -212,18 +237,81 @@ func findNewPinnedCaptionPost(client *http.Client, auth Auth, blog string) (id s
 			if !isNewPinnedIntro(p) {
 				continue
 			}
-			if pid := postIDFromMap(p); pid != "" {
-				return pid, isPinnedPost(p), nil
+			pid := postIDFromMap(p)
+			if pid == "" || seen[pid] {
+				continue
+			}
+			seen[pid] = true
+			ids = append(ids, pid)
+			if isPinnedPost(p) && pinnedID == "" {
+				pinnedID = pid
 			}
 		}
 	}
-	return "", false, nil
+	if len(ids) == 0 {
+		return "", false, nil, nil
+	}
+	keepID = ids[0]
+	if pinnedID != "" {
+		keepID = pinnedID
+		keepPinned = true
+	}
+	for _, id := range ids {
+		if id != keepID {
+			extras = append(extras, id)
+		}
+	}
+	return keepID, keepPinned, extras, nil
 }
 
+// blogAlreadyHasNewPinned uses any working session to check a public blog —
+// avoids opening Chrome just to discover the pin is already up.
+func blogAlreadyHasNewPinned(blog string) bool {
+	ok, extras := blogNewPinnedPublicStatus(blog, 40)
+	return ok && extras == 0
+}
+
+// blogNewPinnedPublicStatus reports whether the Zoey intro is already pinned,
+// and how many duplicate intros are visible in the first maxPosts.
+func blogNewPinnedPublicStatus(blog string, maxPosts int) (hasPinned bool, extraCount int) {
+	blog = normalizeBlogName(blog)
+	if !usableBlogName(blog) {
+		return false, 0
+	}
+	viewer, _, err := pickViewerAuth()
+	if err != nil || !authHasSID(viewer) {
+		return false, 0
+	}
+	client := newHumanClient()
+	id, pinned, extras, err := findNewPinnedCaptionPostsLimit(client, viewer, blog, maxPosts)
+	if err != nil || id == "" || !pinned {
+		return false, len(extras)
+	}
+	return true, len(extras)
+}
+
+// isNewPinnedIntro matches the Zoey intro even when Tumblr drops the beacons
+// URL from summary text (link-only NPF) — that miss was causing duplicate pins.
 func isNewPinnedIntro(p map[string]any) bool {
-	blob := strings.ToLower(postTextBlob(p))
-	return strings.Contains(blob, "redoing pinned") ||
-		(strings.Contains(blob, "skyrim") && strings.Contains(blob, "beacons.ai/lil.cosmic.bunny"))
+	return isNewPinnedIntroText(postTextBlob(p))
+}
+
+func isNewPinnedIntroText(text string) bool {
+	blob := strings.ToLower(text)
+	blob = strings.ReplaceAll(blob, "\u2019", "'")
+	blob = strings.ReplaceAll(blob, "\u2018", "'")
+	if strings.Contains(blob, "redoing pinned") {
+		return true
+	}
+	if strings.Contains(blob, "skyrim") && strings.Contains(blob, "beacons.ai/lil.cosmic.bunny") {
+		return true
+	}
+	// Same caption without a crawlable beacons URL (duplicates on moonlillyyy).
+	hasHi := strings.Contains(blob, "hiii")
+	hasSky := strings.Contains(blob, "skyrim")
+	hasZoey := strings.Contains(blob, "i'm zoey") || strings.Contains(blob, "im zoey")
+	hasHeight := strings.Contains(blob, "5'4") || strings.Contains(blob, "5'4\"") || strings.Contains(blob, "5 foot")
+	return hasHi && hasSky && (hasZoey || hasHeight)
 }
 
 func postIDFromMap(m map[string]any) string {
@@ -257,6 +345,20 @@ func postTextBlob(m map[string]any) string {
 			if s, ok := blk["text"].(string); ok && s != "" {
 				parts = append(parts, s)
 			}
+			if s, ok := blk["url"].(string); ok && s != "" {
+				parts = append(parts, s)
+			}
+			if fmts, ok := blk["formatting"].([]any); ok {
+				for _, f := range fmts {
+					fm, ok := f.(map[string]any)
+					if !ok {
+						continue
+					}
+					if s, ok := fm["url"].(string); ok && s != "" {
+						parts = append(parts, s)
+					}
+				}
+			}
 		}
 	}
 	if trail, ok := m["trail"].([]any); ok {
@@ -277,30 +379,57 @@ func postTextBlob(m map[string]any) string {
 }
 
 // ensureMediaPinnedOnBlog posts only if needed, then pins (GUI pin API).
+// Never creates a second Zoey intro — reuses + pins the existing one and
+// deletes any duplicate intros left on the blog.
 func ensureMediaPinnedOnBlog(client *http.Client, auth *Auth, blogID, imagePath, caption string, pin bool) error {
 	if auth == nil {
 		return fmt.Errorf("missing auth")
 	}
 	auth.Blog = blogID
-	if pin && isNewPinnedIntro(map[string]any{"caption": caption}) {
-		id, pinned, err := findNewPinnedCaptionPost(client, *auth, blogID)
+	if pin && isNewPinnedIntroText(caption) {
+		id, pinned, extras, err := findNewPinnedCaptionPostsLimit(client, *auth, blogID, newPinnedScanPosts)
 		if err != nil {
 			return fmt.Errorf("could not check for an existing pinned post (not posting a duplicate): %w", err)
 		}
 		if id != "" {
 			if pinned {
-				fmt.Println("  already posted + pinned", id, "— skipping")
-				return nil
+				fmt.Println("  already posted + pinned", id, "— skipping new post")
+			} else {
+				fmt.Println("  already posted", id, "— pinning only (no duplicate)")
+				if err := pinBlogPost(client, auth, id); err != nil {
+					return fmt.Errorf("pin existing post: %w", err)
+				}
+				fmt.Println("Pinned post", id)
 			}
-			fmt.Println("  already posted", id, "— pinning only (no duplicate)")
-			if err := pinBlogPost(client, auth, id); err != nil {
-				return fmt.Errorf("pin existing post: %w", err)
+			if err := deleteDuplicatePinnedIntros(client, auth, blogID, extras); err != nil {
+				fmt.Println("  duplicate cleanup:", err)
 			}
-			fmt.Println("Pinned post", id)
 			return nil
 		}
 	}
 	return createPhotoPostOnPinned(client, *auth, blogID, imagePath, caption, pin)
+}
+
+func deleteDuplicatePinnedIntros(client *http.Client, auth *Auth, blog string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	fmt.Printf("  removing %d duplicate pinned-intro post(s)\n", len(ids))
+	var last error
+	removed := 0
+	for _, id := range ids {
+		if err := deleteBlogPost(client, auth, blog, id); err != nil {
+			fmt.Printf("  delete duplicate %s: %v\n", id, err)
+			last = err
+			continue
+		}
+		fmt.Println("  deleted duplicate", id)
+		removed++
+	}
+	if removed == 0 && last != nil {
+		return last
+	}
+	return nil
 }
 
 func formTruthy(s string) bool {
@@ -1068,6 +1197,10 @@ func publishMediaOnFirstLoggedInBlogsPinned(path, caption string, n int, pin boo
 // publishMediaOnTopFollowerBlogs posts (and optionally pins) on the N logged-in
 // accounts with the most followers (unique blogs).
 func publishMediaOnTopFollowerBlogs(path, caption string, n int, pin bool) error {
+	return publishMediaOnTopFollowerBlogsParallel(path, caption, n, pin, 6)
+}
+
+func publishMediaOnTopFollowerBlogsParallel(path, caption string, n int, pin bool, parallel int) error {
 	accs := loggedInTopFollowerAccounts(n)
 	fmt.Printf("Posting %s on top %d follower blogs (%d found)\n", filepath.ToSlash(path), n, len(accs))
 	if pin {
@@ -1082,11 +1215,28 @@ func publishMediaOnTopFollowerBlogs(path, caption string, n int, pin bool) error
 		if blog == "" {
 			blog = auth.Blog
 		}
-		fmt.Printf("  %d) %s  @%s  %d followers\n", i+1, a.ID, blog, fol)
+		fmt.Printf("  %d) %s  @%s  %d followers\n", i+1, accountLabel(a.ID), blog, fol)
 	}
+	par := parallel
+	if par <= 0 {
+		par = 6
+	}
+	if par > 8 {
+		par = 8
+	}
+	fmt.Printf("Photo/pin parallel=%d (Chrome logins still one-at-a-time)\n", par)
+	var seenMu sync.Mutex
 	seenBlog := map[string]string{}
-	return runForEachAccountList("photo post", accs, func() error {
-		return postPhotoOnAllBlogsPinned(path, caption, seenBlog, pin)
+	return runForAccountsParallelLimitedStagger("photo post", accs, par, 0, func(a Account) error {
+		local := map[string]string{}
+		// Must pin under this account's auth — never currentAccount() (races in parallel).
+		err := postPhotoOnAccountPinned(a, path, caption, local, pin)
+		seenMu.Lock()
+		for k, v := range local {
+			seenBlog[k] = v
+		}
+		seenMu.Unlock()
+		return err
 	})
 }
 
@@ -1123,20 +1273,66 @@ func postPhotoOnAllBlogs(imagePath, caption string, seenBlog map[string]string) 
 }
 
 func postPhotoOnAllBlogsPinned(imagePath, caption string, seenBlog map[string]string, pin bool) error {
-	auth, err := loadAuth()
-	if err != nil {
-		return err
+	acc, ok := currentAccount()
+	if !ok || acc.ID == "" {
+		return fmt.Errorf("no active account")
 	}
-	if !authHasSID(auth) {
-		return fmt.Errorf("not logged in")
+	return postPhotoOnAccountPinned(acc, imagePath, caption, seenBlog, pin)
+}
+
+// postPhotoOnAccountPinned posts/pins using that account's auth.json only.
+// Safe for parallel workers (does not touch the global active account).
+func postPhotoOnAccountPinned(acc Account, imagePath, caption string, seenBlog map[string]string, pin bool) error {
+	if acc.ID == "" {
+		return fmt.Errorf("empty account")
 	}
-	acc, _ := currentAccount()
+	// Fast skip: public blog already shows exactly one pinned intro — no login.
+	// If duplicates are visible, fall through so we can delete the extras.
+	if pin {
+		blog := assignedBlogName(acc.ID)
+		if blog == "" {
+			blog, _ = bestAccountBlogStats(acc.ID, loadFollowerLog(acc.ID))
+		}
+		if usableBlogName(blog) {
+			hasPin, extras := blogNewPinnedPublicStatus(blog, 80)
+			if hasPin && extras == 0 {
+				fmt.Printf("[%s] already pinned on @%s (public check) — skipping login\n", acc.ID, blog)
+				if seenBlog != nil {
+					seenBlog[strings.ToLower(blog)] = acc.ID
+				}
+				return nil
+			}
+			if hasPin && extras > 0 {
+				fmt.Printf("[%s] @%s has pinned intro + %d duplicate(s) — cleaning\n", acc.ID, blog, extras)
+			}
+		}
+	}
+	auth, err := loadAuthFrom(accountAuthPath(acc.ID))
+	if err != nil || !authHasSID(auth) {
+		if headlessChrome {
+			return fmt.Errorf("not logged in")
+		}
+		fmt.Printf("[%s] no session — opening Chrome to login…\n", acc.ID)
+		auth = Auth{path: accountAuthPath(acc.ID)}
+	}
 	client := newAuthClient(&auth)
 	if isVideoPath(imagePath) {
 		client.Timeout = 3 * time.Minute
 	}
+	if !authHasSID(auth) {
+		if rec := recoverSession(client, &auth, true); rec != nil {
+			return rec
+		}
+	}
 	if err := ensureSession(client, &auth); err != nil {
-		return err
+		if !headlessChrome {
+			fmt.Printf("[%s] session refresh failed — recovering…\n", acc.ID)
+			if rec := recoverSession(client, &auth, true); rec != nil {
+				return rec
+			}
+		} else {
+			return err
+		}
 	}
 	if _, err := syncAuthIdentity(client, &auth); isForeignBlogSession(err) {
 		return err
@@ -1194,7 +1390,8 @@ func postPhotoOnAllBlogsPinned(imagePath, caption string, seenBlog map[string]st
 		}
 		seenBlog[key] = acc.ID
 		posted++
-		time.Sleep(8 * time.Second)
+		// Short gap only — parallel workers already space load across accounts.
+		time.Sleep(1500 * time.Millisecond)
 	}
 	if posted == 0 && last != nil {
 		return last

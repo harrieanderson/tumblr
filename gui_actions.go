@@ -145,15 +145,25 @@ func guiPhotoPost(hub *logHub, path, caption string, pin bool) error {
 	return nil
 }
 
-func guiLoginAccounts(hub *logHub, accs []Account) error {
+func guiLoginAccounts(hub *logHub, accs []Account, shouldStop func() bool, locks *profileLocks, job string) error {
 	if len(accs) == 0 {
 		return fmt.Errorf("select at least one account")
+	}
+	if job == "" {
+		job = "login"
 	}
 	prevExplicit := explicitLogin
 	explicitLogin = true
 	defer func() { explicitLogin = prevExplicit }()
 	var first error
 	for i, a := range accs {
+		if shouldStop != nil && shouldStop() {
+			hub.broadcast("Stopped — remaining logins skipped.")
+			if first == nil {
+				first = fmt.Errorf("emergency stop")
+			}
+			return first
+		}
 		if a.ID == "" {
 			hub.broadcast("Logging in…")
 			auth, err := loadAuth()
@@ -175,25 +185,32 @@ func guiLoginAccounts(hub *logHub, accs []Account) error {
 			continue
 		}
 		hub.broadcast(fmt.Sprintf("Login %d/%d: %s", i+1, len(accs), a.ID))
-		if err := setActiveAccount(a.ID); err != nil {
-			hub.broadcast(err.Error())
-			if first == nil {
-				first = err
+		if locks != nil {
+			if err := locks.tryLock(a.ID, job); err != nil {
+				hub.broadcast(err.Error())
+				if first == nil {
+					first = err
+				}
+				continue
 			}
-			continue
 		}
-		auth, err := loadAuth()
-		if err != nil {
-			hub.broadcast(err.Error())
-			if first == nil {
-				first = err
+		loginErr := func() error {
+			if err := setActiveAccount(a.ID); err != nil {
+				return err
 			}
-			continue
+			auth, err := loadAuth()
+			if err != nil {
+				return err
+			}
+			return loginWithRealChrome(&auth)
+		}()
+		if locks != nil {
+			locks.unlock(a.ID)
 		}
-		if err := loginWithRealChrome(&auth); err != nil {
-			hub.broadcast("Login failed on " + a.ID + ": " + err.Error())
+		if loginErr != nil {
+			hub.broadcast("Login failed on " + a.ID + ": " + loginErr.Error())
 			if first == nil {
-				first = err
+				first = loginErr
 			}
 			continue
 		}
@@ -287,10 +304,19 @@ func guiOpenAccountChrome(hub *logHub, acc Account) error {
 	}
 
 	if portInUse(port) {
-		liveDebugPort = port
-		liveChromeAccount = acc.ID
-		hub.broadcast("Chrome is already open for " + acc.ID + " — bringing it to the front")
-		return showInbox()
+		if !chromeLaunchUsesProxy(acc.ID, liveChromeProxyID) {
+			hub.broadcast("Chrome for " + acc.ID + " was open without the sticky proxy — relaunching with proxy")
+			ensureFreshChromeForAccount(acc.ID)
+		} else {
+			liveDebugPort = port
+			liveChromeAccount = acc.ID
+			if liveChromeProxyID != "" {
+				hub.broadcast("Chrome is already open for " + acc.ID + " via proxy " + liveChromeProxyID + " — bringing it to the front")
+			} else {
+				hub.broadcast("Chrome is already open for " + acc.ID + " — bringing it to the front")
+			}
+			return showInbox()
+		}
 	}
 
 	prevSkip := skipChromeRecovery
@@ -308,7 +334,14 @@ func guiOpenAccountChrome(hub *logHub, acc Account) error {
 	if _, err := loginWithRealChromeKeepOpen(&auth); err != nil {
 		return err
 	}
-	hub.broadcast("Login OK for " + acc.ID + " — Chrome stays open (unlike Login, which closes it).")
+	if liveChromeProxyID == "" && proxyPool().enabled() {
+		return fmt.Errorf("Watch for %s opened without sticky proxy — refusing home IP; close Chrome and retry", acc.ID)
+	}
+	if liveChromeProxyID != "" {
+		hub.broadcast("Login OK for " + acc.ID + " — Chrome stays open via sticky proxy " + liveChromeProxyID)
+	} else {
+		hub.broadcast("Login OK for " + acc.ID + " — Chrome stays open (unlike Login, which closes it).")
+	}
 	return showInbox()
 }
 

@@ -511,10 +511,13 @@ func (r *proxyRouter) pickProxyLocked(accountID string) *proxyEndpoint {
 func (r *proxyRouter) proxyURLFor(accountID string) (*url.URL, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.proxyURLForLocked(accountID, time.Now())
+}
+
+func (r *proxyRouter) proxyURLForLocked(accountID string, now time.Time) (*url.URL, error) {
 	if !r.cfg.Enabled || len(r.pool) == 0 {
 		return nil, nil
 	}
-	now := time.Now()
 	accountID = accountSlug(accountID)
 	a, ok := r.assign[accountID]
 	if !ok || !a.StickyUntil.After(now) {
@@ -525,6 +528,52 @@ func (r *proxyRouter) proxyURLFor(accountID string) (*url.URL, error) {
 		return nil, nil
 	}
 	return ep.url, nil
+}
+
+// ensureStickyProxy returns the sticky proxy for accountID, binding one if
+// needed. Used for long-lived Chrome (Watch/login/setup): it acquires then
+// immediately releases capacity so the browser session does not hold inFlight
+// for its whole lifetime. Sticky identity is refreshed for StickyMinutes.
+// Only local control-plane traffic should bypass this path.
+func (r *proxyRouter) ensureStickyProxy(ctx context.Context, accountID string) (*url.URL, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	accountID = accountSlug(accountID)
+	if !r.enabled() {
+		return nil, "", nil
+	}
+
+	r.mu.Lock()
+	now := time.Now()
+	if u, _ := r.proxyURLForLocked(accountID, now); u != nil {
+		a := r.assign[accountID]
+		r.assign[accountID] = proxyAssignment{
+			ProxyID:     a.ProxyID,
+			StickyUntil: now.Add(time.Duration(r.cfg.StickyMinutes) * time.Minute),
+		}
+		r.saveStateLocked()
+		id := a.ProxyID
+		r.mu.Unlock()
+		return u, id, nil
+	}
+	r.mu.Unlock()
+
+	id, err := r.acquireLease(ctx, accountID)
+	if err != nil {
+		return nil, "", err
+	}
+	if id != "" {
+		r.releaseLease(id)
+	}
+	u, err := r.proxyURLFor(accountID)
+	if err != nil {
+		return nil, "", err
+	}
+	if u == nil || id == "" {
+		return nil, "", fmt.Errorf("sticky proxy unavailable for %s (refusing direct/home IP)", accountID)
+	}
+	return u, id, nil
 }
 
 // proxyLeaseCtxKey marks a request whose paced RoundTrip already holds a lease,

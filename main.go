@@ -695,7 +695,7 @@ func main() {
 		}
 		par := parallelN
 		if par <= 0 {
-			par = 6
+			par = wipeDefaultParallel
 		}
 		if err := runWipePosts(wipeKeepPinned, wipeDryRun, photoFullySetup, only, par); err != nil {
 			fmt.Println("Wipe posts:", err)
@@ -906,16 +906,26 @@ func main() {
 	}
 
 	if photoFile != "" {
-		skipChromeRecovery = true
+		// Dead cookies need Chrome login. Only block that while headless —
+		// otherwise -new-pinned/-photo-file soft-skip every expired session.
+		if headlessChrome {
+			skipChromeRecovery = true
+		}
 		nativeChromeClicks = false
+		quietChromeLogin = true
 		photoCaption = strings.ReplaceAll(photoCaption, `\n`, "\n")
 		var err error
-		if accountFlag != "" && !runAllAccounts {
+		// -account wins over -new-pinned's default "all blogs" fan-out.
+		if accountFlag != "" {
 			err = postPhotoOnAllBlogsPinned(photoFile, photoCaption, map[string]string{}, photoPin)
 		} else if photoFullySetup {
 			err = publishMediaOnFullySetupBlogs(photoFile, photoCaption, photoPin)
 		} else if photoTopFollowers > 0 {
-			err = publishMediaOnTopFollowerBlogs(photoFile, photoCaption, photoTopFollowers, photoPin)
+			par := parallelN
+			if par <= 0 {
+				par = 6
+			}
+			err = publishMediaOnTopFollowerBlogsParallel(photoFile, photoCaption, photoTopFollowers, photoPin, par)
 		} else {
 			err = publishMediaOnUniqueBlogsPinned(photoFile, photoCaption, photoPin)
 		}
@@ -949,12 +959,12 @@ func main() {
 	fmt.Println("  -follow          seed/tag post engagers (rebloggers first, then likers): like them, sometimes follow")
 	fmt.Println("  -growth          score follower gains, park losers, reorder reach + seed blogs")
 	fmt.Println("  -for 60         stop after 60 minutes (or -for 1h); use with -follow")
-	fmt.Println("  -parallel N      run N accounts at once from top-follower pool (~80: top 20 + next 60); use with -follow")
+	fmt.Println("  -parallel N      accounts at once: -follow (top-follower pool) or -wipe-posts (default 10, max 12; bulk 100 ids/request)")
 	fmt.Println("  -gui        local web GUI (desktop window is run.bat / gui.py)")
 	fmt.Println("  -post       pick a pic from pics/posted, type a caption, post on every blog")
 	fmt.Println("  -new-pinned  post+pin pics/posted/new_pinned1.jpg on all logged-in blogs (Clicky→beacons)")
 	fmt.Println("  -fully-setup with -new-pinned/-photo-file/-wipe-posts: accounts in zoey-fully-setup.json")
-	fmt.Println("  -wipe-posts  delete published posts on logged-in accounts (API; keeps pinned unless -include-pinned)")
+	fmt.Println("  -wipe-posts  mass delete via mega-editor /delete_posts (100 ids/request; keeps pinned unless -include-pinned)")
 	fmt.Println("  -include-pinned  with -wipe-posts: also delete pinned posts")
 	fmt.Println("  -dry-run     with -wipe-posts / -messages-reply: show actions, change nothing")
 	fmt.Println("  -pin         pin after photo/video publish (with -photo-file / -new-pinned)")
@@ -969,7 +979,7 @@ func main() {
 	fmt.Println("  -set-avatars   set profile pics from pics/profile_pic on every account")
 	fmt.Println("  -setup-profile English, birthday, AgeKey first, then pic/banner/colours/username")
 	fmt.Println("  -skip-agekey   with -setup-profile: leave AgeKey for manual verification")
-	fmt.Println("  -setup-accounts FILE  account id list for -setup-profile (use for parallel lanes)")
+	fmt.Println("  -setup-accounts FILE  account id list for -setup-profile / -wipe-posts lanes")
 	fmt.Println("  -blog-look     username + banner + purple/black theme on the first 20 logged-in blogs")
 	fmt.Println("  -fix-bio      strip #000000/#7C3AED leaked into blog descriptions")
 	fmt.Println("  -from N        start at account N (1-based) or ID; use with -setup-profile")
@@ -1075,21 +1085,27 @@ func reachTurn(a Account, until time.Time) error {
 
 func ensureSession(client *http.Client, auth *Auth) error {
 	attachAuthJar(client, auth)
-	if err := refreshCSRF(client, auth); err != nil {
-		fmt.Println("CSRF/cookie failed — recovering a working session…")
-		if err := recoverSession(client, auth, false); err != nil {
-			return err
-		}
+	// Cheap authenticated preflight first; only recover when it fails.
+	if err := preflightSession(client, auth); err == nil {
+		return nil
+	} else if isNeedsInteractiveLogin(err) {
+		return err
+	}
+	fmt.Println("CSRF/cookie failed — recovering a working session…")
+	if err := recoverSession(client, auth, false); err != nil {
+		return err
 	}
 	maybeFillBlog(client, auth)
 	return nil
 }
 
 // recoverSession collects a working cookie:
-//  1. copy whatever sid is still in this account’s Chrome profile (no window)
-//  2. if Tumblr rejected that too, open that account’s Chrome, sign in, save a
+//  1. refuse when needsInteractiveLogin is set (unless forceLogin / -login)
+//  2. copy whatever sid is still in this account’s Chrome profile (no window)
+//  3. if Tumblr rejected that too, open that account’s Chrome, sign in, save a
 //     new cookie, close Chrome. Serialized by chromeLoginMu so parallel
 //     workers (wipe/reach) auto-relogin one account at a time.
+//  4. bound Chrome launches; captcha/exhaustion → needsInteractiveLogin in auth.json
 func recoverSession(client *http.Client, auth *Auth, forceLogin bool) error {
 	chromeLoginMu.Lock()
 	defer chromeLoginMu.Unlock()
@@ -1097,6 +1113,13 @@ func recoverSession(client *http.Client, auth *Auth, forceLogin bool) error {
 	id := accountIDFromAuth(*auth)
 	if accountIsTerminated(id) {
 		return terminatedAccountError{ID: id}
+	}
+
+	if !forceLogin && sessionBlocksChromeRecovery(auth) {
+		return needsInteractiveLoginError{ID: id, Reason: "flagged in auth.json — run -login"}
+	}
+	if forceLogin && auth != nil {
+		clearNeedsInteractiveLogin(auth)
 	}
 
 	if !forceLogin {
@@ -1110,26 +1133,54 @@ func recoverSession(client *http.Client, auth *Auth, forceLogin bool) error {
 				return nil
 			}
 		}
+		if recoveryAttemptsExhausted(auth) {
+			return markNeedsInteractiveLogin(auth, "recovery attempts exhausted")
+		}
 	}
 
-	if headlessCookieOnly || skipChromeRecovery {
-		return fmt.Errorf("session expired (headless cookie sync failed; run -login when you can use a visible window)")
+	// Headless / Hide Chrome: never pop a physical login window (gaming).
+	// Cookie scrape above already ran; soft-skip so wipe/reach keep moving.
+	if headlessCookieOnly || skipChromeRecovery || headlessChrome {
+		return markNeedsInteractiveLogin(auth, "headless cookie sync failed")
 	}
 
 	fmt.Println("Profile cookie is dead — opening Chrome to sign in and collect a new one…")
+	noteRecoveryAttempt(auth)
+	if auth != nil && auth.path != "" {
+		_ = saveAuth(*auth)
+	}
 	prevSkip := skipChromeRecovery
 	skipChromeRecovery = false
 	defer func() { skipChromeRecovery = prevSkip }()
 
 	time.Sleep(3 * time.Second)
 	if err := loginChromeSession(auth, true); err != nil {
+		reason := interactiveReasonFrom(err)
+		if strings.Contains(strings.ToLower(err.Error()), "captcha") ||
+			recoveryAttemptsExhausted(auth) ||
+			quietChromeLogin {
+			return markNeedsInteractiveLogin(auth, reason)
+		}
 		return err
+	}
+	// Prefer disk copy in case login wrote auth.json and in-memory fields lagged.
+	if id := accountIDFromAuth(*auth); id != "" {
+		if fresh, loadErr := loadAuthFrom(accountAuthPath(id)); loadErr == nil && authHasSID(fresh) {
+			*auth = fresh
+		}
 	}
 	attachAuthJar(client, auth)
 	if err := refreshCSRF(client, auth); err != nil {
+		if recoveryAttemptsExhausted(auth) || quietChromeLogin {
+			return markNeedsInteractiveLogin(auth, interactiveReasonFrom(err))
+		}
 		return err
 	}
 	maybeFillBlog(client, auth)
+	clearNeedsInteractiveLogin(auth)
+	if auth != nil && auth.path != "" {
+		_ = saveAuth(*auth)
+	}
 	if id = accountIDFromAuth(*auth); id != "" {
 		sessionDead.Delete(id)
 	}
